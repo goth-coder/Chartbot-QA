@@ -193,7 +193,11 @@ def looks_like_chart(image_bytes: bytes) -> tuple[bool, float]:
     """
     prob = _clip_chart_prob(image_bytes)
     if prob is not None:
-        # Chart iff CLIP says chart AND the image shows real numeric data.
-        is_chart = prob >= _CLIP_THRESHOLD and _has_data_values(image_bytes)
-        return is_chart, round(prob, 3)
+        # Chart iff CLIP is confident it's a chart. The OCR "has numeric data" veto was
+        # dropped (2026-07-13): it produced false "not a chart" verdicts on real charts
+        # whose values are labels rather than OCR-legible digits — e.g. a horizontal bar
+        # chart of country names, or small/anti-aliased axis ticks Tesseract misses. CLIP
+        # recognizes chart *structure* reliably; the digit check was too brittle to gate
+        # on. (_has_data_values is kept for optional confidence boosting / future use.)
+        return prob >= _CLIP_THRESHOLD, round(prob, 3)
     return _heuristic_chart(image_bytes)

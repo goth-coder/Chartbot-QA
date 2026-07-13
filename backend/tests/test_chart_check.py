@@ -51,22 +51,25 @@ def test_none_prob_falls_back_to_heuristic(monkeypatch):
     assert chart_check.looks_like_chart(b"ignored") is sentinel
 
 
-def test_data_gate_vetoes_chart_without_data(monkeypatch):
-    # CLIP is confident it's a chart, but OCR finds no numeric data (e.g. an
-    # infographic of chart-type icons) -> the data gate vetoes -> NOT a chart.
+def test_clip_confident_is_chart_without_ocr(monkeypatch):
+    # CLIP is confident it's a chart -> chart, regardless of OCR. The OCR "has numeric
+    # data" veto was removed (2026-07-13): it falsely rejected real charts whose values
+    # are labels (e.g. a horizontal bar chart of country names) or whose axis digits
+    # Tesseract can't read. So even with no OCR-legible digits, a CLIP-confident chart
+    # is a chart.
     monkeypatch.setattr(chart_check, "_clip_chart_prob", lambda b: 0.95)
     monkeypatch.setattr(chart_check, "_has_data_values", lambda b: False)
-    is_chart, _ = chart_check.looks_like_chart(b"img")
-    assert is_chart is False
-
-
-def test_data_gate_allows_chart_with_data(monkeypatch):
-    # CLIP says chart AND OCR finds numeric data values -> chart.
-    monkeypatch.setattr(chart_check, "_clip_chart_prob", lambda b: 0.95)
-    monkeypatch.setattr(chart_check, "_has_data_values", lambda b: True)
     is_chart, conf = chart_check.looks_like_chart(b"img")
     assert is_chart is True
     assert conf == 0.95
+
+
+def test_clip_below_threshold_is_not_chart(monkeypatch):
+    # CLIP unsure it's a chart -> not a chart (the confidence, P(chart), is returned).
+    monkeypatch.setattr(chart_check, "_clip_chart_prob", lambda b: 0.2)
+    is_chart, conf = chart_check.looks_like_chart(b"img")
+    assert is_chart is False
+    assert conf == 0.2
 
 
 def test_fallback_when_clip_cannot_load(monkeypatch):

@@ -178,8 +178,13 @@ function App() {
     const controller = new AbortController()
     abortRef.current = controller
 
-    // Optimistically add the user's turn to the transcript and clear the input.
-    setMessages((prev) => [...prev, { role: 'user', text: q }])
+    // Optimistically add the user's turn to the transcript and clear the input. The chart
+    // rides on the FIRST user message (ChatGPT-style: the image shows above the question
+    // that introduced it), not as a separate always-on header.
+    setMessages((prev) => [
+      ...prev,
+      { role: 'user', text: q, imageUrl: prev.length === 0 ? previewUrl : null },
+    ])
     setQuestion('')
     setLoading(true)
     try {
@@ -288,13 +293,15 @@ function App() {
           </div>
         ) : (
           <div className="card chat-card">
-            {/* Pinned chart header once a conversation has an image */}
-            {previewUrl && (
+            {/* Selected-chart confirmation — compact, only BEFORE the first question is
+                sent. Once sent, the image moves into the first user bubble (ChatGPT-style),
+                so this chip disappears and doesn't duplicate it. */}
+            {previewUrl && messages.length === 0 && (
               <div className="chart-header">
-                <img className="chart-thumb" src={previewUrl} alt="Chart in conversation" />
+                <img className="chart-thumb" src={previewUrl} alt="Selected chart" />
                 <div className="chart-meta">
                   <span className="chart-name">{image?.name}</span>
-                  <span className="chart-hint">This chart is pinned for the conversation.</span>
+                  <span className="chart-hint">Ask a question about this chart below.</span>
                 </div>
               </div>
             )}
@@ -340,8 +347,7 @@ function App() {
                       <div className={`bubble-body ${m.blocked ? 'bubble-blocked' : ''}`}>
                         {m.detect && !m.detect.is_chart && (
                           <p className="detect detect-warn">
-                            ⚠️ This doesn&apos;t look like a chart (
-                            {Math.round(m.detect.confidence * 100)}%) — results may be unreliable.
+                            ⚠️ This may not be a chart — the answer might be unreliable.
                           </p>
                         )}
                         <div className="markdown">
@@ -379,7 +385,12 @@ function App() {
                         )}
                       </div>
                     ) : (
-                      <div className="bubble-body">{m.text}</div>
+                      <div className="bubble-user-wrap">
+                        {m.imageUrl && (
+                          <img className="bubble-image" src={m.imageUrl} alt="Uploaded chart" />
+                        )}
+                        <div className="bubble-body">{m.text}</div>
+                      </div>
                     )}
                   </li>
                 ))}
