@@ -67,17 +67,25 @@ def health():
 @app.post("/predict")
 def predict():
     data = request.get_json(silent=True) or {}
-    image_b64 = data.get("image")
+    # Accept `images` (list of base64, oldest -> newest) for multi-chart conversations;
+    # fall back to a single `image` for the classic one-chart contract.
+    images_b64 = data.get("images")
+    if not images_b64:
+        single = data.get("image")
+        images_b64 = [single] if single else []
     question = (data.get("question") or "").strip()
-    # Optional multi-turn history: prior [{"role","text"}] turns about the SAME image.
-    # The image is attached only to the first user turn (build_messages handles that).
+    # Optional multi-turn history: prior [{"role","text"}] turns. build_messages numbers
+    # the images and attaches them once, in a leading turn.
     history = data.get("history") or None
-    if not image_b64 or not question:
-        return jsonify(error="Both 'image' (base64) and 'question' are required."), 400
+    if not images_b64 or not question:
+        return jsonify(error="'images' (base64 list) and 'question' are required."), 400
 
-    image = Image.open(io.BytesIO(base64.b64decode(image_b64))).convert("RGB")
+    pil_images = [
+        Image.open(io.BytesIO(base64.b64decode(b))).convert("RGB") for b in images_b64
+    ]
     raw = _CHAT.chat(
-        image=image, text=question + _SUFFIX, max_new_tokens=_MAX_NEW_TOKENS, history=history
+        images=pil_images, text=question + _SUFFIX, max_new_tokens=_MAX_NEW_TOKENS,
+        history=history,
     )
     # Same post-processing as the in-process path so both modes return identical answers.
     answer = raw.split("Answer:")[-1].strip()

@@ -109,16 +109,22 @@ function App() {
     }
   }, [token])
 
-  // Revoke object URLs when they change/unmount to avoid leaks.
-  useEffect(() => {
-    return () => {
-      if (previewUrl) URL.revokeObjectURL(previewUrl)
-    }
-  }, [previewUrl])
+  // NOTE: object URLs are NOT auto-revoked when previewUrl/messages change, because once
+  // an image is sent its URL moves into a message and must stay valid to render in the
+  // transcript. We track every URL we mint in a ref and revoke them all only on unmount
+  // (and per-URL in clearImage/resetConversation). The PENDING preview is revoked
+  // explicitly in selectImage/clearImage.
+  const objectUrlsRef = useRef(new Set())
 
-  // Abort any in-flight request if the component unmounts.
+  // Abort any in-flight request + revoke every minted object URL, only on true unmount.
   useEffect(() => {
-    return () => abortRef.current?.abort()
+    const urls = objectUrlsRef.current // stable Set, created once — snapshot for cleanup
+    const abort = abortRef
+    return () => {
+      abort.current?.abort()
+      urls.forEach((u) => URL.revokeObjectURL(u))
+      urls.clear()
+    }
   }, [])
 
   // Keep the newest message in view as the transcript grows.
@@ -136,14 +142,32 @@ function App() {
       setError('Image is larger than 10 MB.')
       return
     }
-    if (previewUrl) URL.revokeObjectURL(previewUrl)
+    // Revoke the previous PENDING preview (not yet sent, so not owned by a message).
+    if (previewUrl) {
+      URL.revokeObjectURL(previewUrl)
+      objectUrlsRef.current.delete(previewUrl)
+    }
+    const url = URL.createObjectURL(file)
+    objectUrlsRef.current.add(url)
     setImage(file)
-    setPreviewUrl(URL.createObjectURL(file))
+    setPreviewUrl(url)
     setError('')
   }
 
   function onFileChange(e) {
     selectImage(e.target.files?.[0])
+  }
+
+  // Clear the chosen-but-not-yet-sent image so the user can pick a different one.
+  function clearImage() {
+    if (previewUrl) {
+      URL.revokeObjectURL(previewUrl)
+      objectUrlsRef.current.delete(previewUrl)
+    }
+    setImage(null)
+    setPreviewUrl('')
+    setError('')
+    if (fileInputRef.current) fileInputRef.current.value = '' // allow re-picking the same file
   }
 
   function onDrop(e) {
@@ -153,7 +177,9 @@ function App() {
 
   function resetConversation() {
     abortRef.current?.abort()
-    if (previewUrl) URL.revokeObjectURL(previewUrl)
+    // Revoke every URL minted this session (pending preview + all message-owned images).
+    objectUrlsRef.current.forEach((u) => URL.revokeObjectURL(u))
+    objectUrlsRef.current.clear()
     setImage(null)
     setPreviewUrl('')
     setQuestion('')
@@ -169,7 +195,10 @@ function App() {
     setError('')
     setStages({})
     const q = question.trim()
-    if (!image) return setError('Please upload an image.')
+    const inConversation = messages.length > 0
+    // An image is required to START a conversation; on a follow-up it's optional (the
+    // server reuses the conversation's stored charts), but the user MAY attach a new one.
+    if (!inConversation && !image) return setError('Please upload an image.')
     if (!q) return setError('Please type a question.')
     if (questionTooWeak(q)) return setError('Please ask a more specific question.')
 
@@ -178,14 +207,18 @@ function App() {
     const controller = new AbortController()
     abortRef.current = controller
 
-    // Optimistically add the user's turn to the transcript and clear the input. The chart
-    // rides on the FIRST user message (ChatGPT-style: the image shows above the question
-    // that introduced it), not as a separate always-on header.
-    setMessages((prev) => [
-      ...prev,
-      { role: 'user', text: q, imageUrl: prev.length === 0 ? previewUrl : null },
-    ])
+    // Optimistically add the user's turn to the transcript. If an image is attached this
+    // turn (turn 1, or a mid-conversation upload), it rides on THIS user bubble
+    // (ChatGPT-style: image above the question that introduced it). Clear the input +
+    // the just-consumed image attachment.
+    const attachedUrl = image ? previewUrl : null
+    const messageIndex = messages.length
+    setMessages((prev) => [...prev, { role: 'user', text: q, imageUrl: attachedUrl }])
     setQuestion('')
+    // Detach the image now that it's committed to a message (its object URL stays valid —
+    // it's referenced by the message; a new pick / reset revokes it).
+    setImage(null)
+    setPreviewUrl('')
     setLoading(true)
     try {
       const result = await askQuestionStream(image, q, {
@@ -200,6 +233,13 @@ function App() {
         },
       })
       if (result.conversation_id) setConversationId(result.conversation_id)
+      // Tag the user bubble with the image number the server assigned, so the transcript
+      // can show "Image N" and the user knows how to reference it ("ask about image 1").
+      if (result.image_index) {
+        setMessages((prev) =>
+          prev.map((m, i) => (i === messageIndex ? { ...m, imageIndex: result.image_index } : m))
+        )
+      }
       if (result.blocked) {
         // Guard (Layer 2/3) or the chart gate rejected the request — show it as an
         // assistant message so the conversation stays coherent.
@@ -249,7 +289,9 @@ function App() {
     await sendFeedback({ conversationId, vote: value, token })
   }
 
-  const canSubmit = image && question.trim() && !loading
+  // Can submit when there's a question AND either an image is attached OR the conversation
+  // already has charts (a follow-up reuses the stored images).
+  const canSubmit = (image || started) && question.trim() && !loading
 
   return (
     <div className="page">
@@ -303,6 +345,15 @@ function App() {
                   <span className="chart-name">{image?.name}</span>
                   <span className="chart-hint">Ask a question about this chart below.</span>
                 </div>
+                <button
+                  type="button"
+                  className="chart-remove"
+                  onClick={clearImage}
+                  aria-label="Remove image"
+                  title="Remove image"
+                >
+                  ✕
+                </button>
               </div>
             )}
 
@@ -387,7 +438,14 @@ function App() {
                     ) : (
                       <div className="bubble-user-wrap">
                         {m.imageUrl && (
-                          <img className="bubble-image" src={m.imageUrl} alt="Uploaded chart" />
+                          <figure className="bubble-figure">
+                            <img className="bubble-image" src={m.imageUrl} alt="Uploaded chart" />
+                            {m.imageIndex && (
+                              <figcaption className="bubble-image-cap">
+                                Image {m.imageIndex}
+                              </figcaption>
+                            )}
+                          </figure>
                         )}
                         <div className="bubble-body">{m.text}</div>
                       </div>
@@ -427,21 +485,57 @@ function App() {
 
             <div ref={transcriptEndRef} />
 
+            {/* Pending mid-conversation attachment (a chart added for the NEXT question) */}
+            {started && previewUrl && (
+              <div className="attach-chip">
+                <img className="attach-thumb" src={previewUrl} alt="Attached chart" />
+                <span className="attach-name">{image?.name || 'New chart'}</span>
+                <button
+                  type="button"
+                  className="attach-remove"
+                  onClick={clearImage}
+                  aria-label="Remove attachment"
+                  title="Remove attachment"
+                >
+                  ✕
+                </button>
+              </div>
+            )}
+
             {/* Composer */}
             <form className="composer" onSubmit={onSubmit}>
+              {/* Attach a chart to the next question (ChatGPT-style). Only mid-conversation;
+                  turn 1 uses the big picker above. */}
+              {started && (
+                <button
+                  type="button"
+                  className="attach-btn"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={loading}
+                  aria-label="Attach a chart image"
+                  title="Attach a chart image"
+                >
+                  <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+                    <path
+                      fill="currentColor"
+                      d="M21 19V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2M8.5 11l2.5 3 3.5-4.5L19 17H5z"
+                    />
+                  </svg>
+                </button>
+              )}
               <input
                 type="text"
                 className="text-input"
                 placeholder={
-                  image
-                    ? messages.length
-                      ? 'Ask a follow-up…'
-                      : 'e.g. What was the revenue in 2024?'
-                    : 'Upload a chart image first…'
+                  started
+                    ? 'Ask a follow-up…'
+                    : image
+                      ? 'e.g. What was the revenue in 2024?'
+                      : 'Upload a chart image first…'
                 }
                 value={question}
                 onChange={(e) => setQuestion(e.target.value)}
-                disabled={!image || loading}
+                disabled={(!image && !started) || loading}
               />
               <button type="submit" className="submit" disabled={!canSubmit}>
                 {loading ? (

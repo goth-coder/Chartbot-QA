@@ -1,21 +1,22 @@
 """Multi-turn conversation store (Phase 5) — the server-side memory for the chatbot.
 
-Holds, per ``conversation_id``: the chat history (a list of ``{role, text}`` turns) and
-the sanitized chart image the whole conversation is about. On turn 1 the client uploads
-the image; on follow-up turns it sends only ``conversation_id`` + question, and the
-backend re-hydrates the image + prior turns from here.
+Holds, per ``conversation_id``: the chat history (a list of ``{role, text[, image_index]}``
+turns) and an ORDERED LIST of the chart images the conversation is about. Turn 1 uploads
+the first image; later turns may add more (ChatGPT-style) or send only the
+``conversation_id`` + question, in which case the backend re-hydrates the images + prior
+turns from here. Images are numbered (1-based) so the user can ask about "image 1", etc.
 
 **Two backends behind one seam** (same shape as ``answer_cache.py``): when ``REDIS_URL``
 is set and reachable, state lives in **Redis** (shared across gunicorn workers, native
 TTL); otherwise an in-process dict (right for ``--dev`` / a single worker).
 
 **Fail-open by design:** any store error is swallowed and treated as "no conversation" —
-a lost conversation just means the client must re-upload the image / the follow-up starts
-fresh, never a 500. The image is base64-encoded in a *separate* key from the (small)
-message list so a re-hydrate that only needs history doesn't pull the whole PNG.
+a lost conversation just means the client must re-upload / the follow-up starts fresh,
+never a 500. Images live in a *separate* key from the (small) message list so a
+history-only read doesn't pull the PNGs.
 
-**TTL is refreshed on every write** (``touch``), so an actively-used conversation never
-expires mid-chat; only abandoned ones age out (default 30 min).
+**TTL is refreshed on every write**, so an actively-used conversation never expires
+mid-chat; only abandoned ones age out (default 30 min).
 
 Config (.env): ``CONVERSATION_ENABLED``, ``CONVERSATION_TTL_S`` (idle expiry),
 ``CONVERSATION_MAX_TURNS`` (sliding-window cap on stored user/assistant pairs).
@@ -35,15 +36,19 @@ _ENABLED = env_bool("CONVERSATION_ENABLED")
 _TTL = env_int("CONVERSATION_TTL_S")
 _MAX_TURNS = env_int("CONVERSATION_MAX_TURNS")
 
-# Separate Redis namespaces: the (small) history JSON vs. the (large) image bytes, so a
-# history-only read never transfers the PNG. Both share the same conversation_id and TTL.
+# Hard ceiling on images STORED per conversation (bounds memory / Redis value size). The
+# smaller VLM-facing cap (CONVERSATION_MAX_IMAGES) is applied by the caller at read time.
+_MAX_STORED_IMAGES = 20
+
+# Separate Redis namespaces: the (small) history JSON vs. the (large) image list, so a
+# history-only read never transfers the PNGs. Both share the same conversation_id and TTL.
 _RPREFIX = "conversation:"
-_IPREFIX = "conversation_image:"
+_IPREFIX = "conversation_images:"
 
 # In-memory fallback. id -> (stored_at_epoch, {"messages": [...], "created_ts": float}).
 _store: dict[str, tuple[float, dict]] = {}
-# id -> (stored_at_epoch, image_bytes)
-_images: dict[str, tuple[float, bytes]] = {}
+# id -> (stored_at_epoch, [image_bytes, ...])  (ordered, oldest -> newest)
+_images: dict[str, tuple[float, list[bytes]]] = {}
 _lock = Lock()
 
 
@@ -68,7 +73,7 @@ def trim(messages: list[dict]) -> list[dict]:
 
 def get(conversation_id: str) -> dict | None:
     """Return ``{"messages": [...], "created_ts": float}`` for this id, or None if
-    unknown/expired/disabled. Does not include the image (see :func:`get_image`)."""
+    unknown/expired/disabled. Does not include images (see :func:`get_images`)."""
     if not _ENABLED or not conversation_id:
         return None
     try:
@@ -81,57 +86,72 @@ def get(conversation_id: str) -> dict | None:
         return None
 
 
-def get_image(conversation_id: str) -> bytes | None:
-    """Return the sanitized image bytes for this conversation, or None."""
+def get_images(conversation_id: str) -> list[bytes]:
+    """Return the conversation's images (oldest -> newest), or [] if none/expired."""
     if not _ENABLED or not conversation_id:
-        return None
+        return []
     try:
         r = redis_client.client()
         if r is not None:
             raw = r.get(_IPREFIX + conversation_id)
-            return base64.b64decode(raw) if raw else None
-        return _mem_get_image(conversation_id)
+            if not raw:
+                return []
+            return [base64.b64decode(b) for b in json.loads(raw)]
+        return _mem_get_images(conversation_id)
     except Exception:  # noqa: BLE001
-        return None
+        return []
 
 
-def start(conversation_id: str, image_bytes: bytes) -> None:
-    """Begin a conversation: store its image and an empty history. Idempotent — re-starting
-    an existing id just refreshes the image + TTL (harmless if the client retries turn 1)."""
+def add_image(conversation_id: str, image_bytes: bytes) -> int:
+    """Append an image to the conversation and return its 1-based index. Also seeds an
+    empty message history on the first image, and refreshes the TTL. Enforces
+    ``_MAX_STORED_IMAGES`` (drops the oldest past the ceiling — the returned index still
+    reflects the count of images retained). Returns 0 when disabled/errored (fail-open)."""
     if not _ENABLED or not conversation_id:
-        return
+        return 0
     try:
+        images = get_images(conversation_id)
+        images.append(image_bytes)
+        if len(images) > _MAX_STORED_IMAGES:
+            images = images[-_MAX_STORED_IMAGES:]
+        index = len(images)  # 1-based index of the image just added (post-trim)
         r = redis_client.client()
         if r is not None:
             ex = _TTL if _TTL > 0 else None
-            r.set(_IPREFIX + conversation_id, base64.b64encode(image_bytes).decode("ascii"), ex=ex)
-            existing = r.get(_RPREFIX + conversation_id)
-            if not existing:
+            encoded = json.dumps([base64.b64encode(b).decode("ascii") for b in images])
+            r.set(_IPREFIX + conversation_id, encoded, ex=ex)
+            if not r.get(_RPREFIX + conversation_id):
                 state = {"messages": [], "created_ts": time.time()}
                 r.set(_RPREFIX + conversation_id, json.dumps(state), ex=ex)
-            return
-        _mem_start(conversation_id, image_bytes)
+            return index
+        _mem_add_image(conversation_id, images)
+        return index
     except Exception:  # noqa: BLE001
-        pass
+        return 0
 
 
-def append_turn(conversation_id: str, question: str, answer: str) -> None:
-    """Append one user turn + one assistant turn, trim to the sliding window, and refresh
-    the TTL on both the history and the image so an active chat never expires mid-use."""
+def append_turn(
+    conversation_id: str, question: str, answer: str, image_index: int | None = None
+) -> None:
+    """Append one user turn (optionally tagged with the image index it added) + one
+    assistant turn, trim to the sliding window, and refresh the TTL on both the history and
+    the images so an active chat never expires mid-use."""
     if not _ENABLED or not conversation_id:
         return
     try:
         state = get(conversation_id) or {"messages": [], "created_ts": time.time()}
         messages = state.get("messages", [])
-        messages.append({"role": "user", "text": question})
+        user_turn = {"role": "user", "text": question}
+        if image_index:
+            user_turn["image_index"] = image_index
+        messages.append(user_turn)
         messages.append({"role": "assistant", "text": answer})
         state["messages"] = trim(messages)
         r = redis_client.client()
         if r is not None:
             ex = _TTL if _TTL > 0 else None
             r.set(_RPREFIX + conversation_id, json.dumps(state), ex=ex)
-            # Refresh the image key's TTL too (it's the same conversation staying alive).
-            if ex is not None:
+            if ex is not None:  # keep the images alive as long as the chat is active
                 r.expire(_IPREFIX + conversation_id, ex)
             return
         _mem_append(conversation_id, state)
@@ -152,23 +172,23 @@ def _mem_get(conversation_id: str) -> dict | None:
         return json.loads(json.dumps(state))  # deep copy so callers can't mutate the store
 
 
-def _mem_get_image(conversation_id: str) -> bytes | None:
+def _mem_get_images(conversation_id: str) -> list[bytes]:
     with _lock:
         entry = _images.get(conversation_id)
         if entry is None:
-            return None
-        stored_at, image_bytes = entry
+            return []
+        stored_at, images = entry
         if _expired(stored_at):
             _images.pop(conversation_id, None)
             _store.pop(conversation_id, None)
-            return None
-        return image_bytes
+            return []
+        return list(images)
 
 
-def _mem_start(conversation_id: str, image_bytes: bytes) -> None:
+def _mem_add_image(conversation_id: str, images: list[bytes]) -> None:
     with _lock:
         now = time.time()
-        _images[conversation_id] = (now, image_bytes)
+        _images[conversation_id] = (now, list(images))
         if conversation_id not in _store:
             _store[conversation_id] = (now, {"messages": [], "created_ts": now})
 
@@ -177,9 +197,9 @@ def _mem_append(conversation_id: str, state: dict) -> None:
     with _lock:
         now = time.time()
         _store[conversation_id] = (now, state)
-        img = _images.get(conversation_id)
-        if img is not None:
-            _images[conversation_id] = (now, img[1])  # refresh image TTL too
+        imgs = _images.get(conversation_id)
+        if imgs is not None:
+            _images[conversation_id] = (now, imgs[1])  # refresh image TTL too
 
 
 def reset() -> None:

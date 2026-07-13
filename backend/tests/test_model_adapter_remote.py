@@ -56,12 +56,21 @@ def test_predict_routes_to_remote_when_vlm_url_set(monkeypatch, stub_url):
     monkeypatch.setenv("VLM_URL", stub_url)
     monkeypatch.setenv("VLM_TIMEOUT", "10")
 
-    answer = model_adapter.predict(_PNG_1x1, "  what is the max?  ")
+    answer = model_adapter.predict([_PNG_1x1], "  what is the max?  ")
 
     assert answer == "42"
-    # Real round-trip: the stub got the stripped question + the base64 image verbatim.
+    # Real round-trip: the stub got the stripped question + the base64 image list verbatim.
     assert _StubVLM.received["question"] == "what is the max?"
-    assert base64.b64decode(_StubVLM.received["image"]) == _PNG_1x1
+    assert [base64.b64decode(b) for b in _StubVLM.received["images"]] == [_PNG_1x1]
+
+
+def test_predict_sends_multiple_images_to_remote(monkeypatch, stub_url):
+    monkeypatch.setenv("VLM_URL", stub_url)
+    monkeypatch.setenv("VLM_TIMEOUT", "10")
+
+    model_adapter.predict([_PNG_1x1, _PNG_1x1], "compare image 1 and image 2")
+
+    assert len(_StubVLM.received["images"]) == 2
 
 
 def test_predict_stays_in_process_when_vlm_url_empty(monkeypatch):
@@ -73,7 +82,8 @@ def test_predict_stays_in_process_when_vlm_url_empty(monkeypatch):
     captured = {}
 
     class _FakeChat:
-        def chat(self, image, text, max_new_tokens, history=None):
+        def chat(self, images, text, max_new_tokens, history=None):
+            captured["images"] = images
             captured["text"] = text
             captured["max_new_tokens"] = max_new_tokens
             captured["history"] = history
@@ -81,8 +91,9 @@ def test_predict_stays_in_process_when_vlm_url_empty(monkeypatch):
 
     monkeypatch.setattr(model_adapter, "_load_model", lambda: _FakeChat())
 
-    answer = model_adapter.predict(_PNG_1x1, "  q  ")
+    answer = model_adapter.predict([_PNG_1x1], "  q  ")
 
     assert answer == "local-7"  # real "Answer:" stripping ran
     assert captured["text"] == "q please answer"  # real suffix application ran
     assert captured["max_new_tokens"] == 8
+    assert len(captured["images"]) == 1  # decoded to a 1-element PIL list

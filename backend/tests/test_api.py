@@ -381,10 +381,13 @@ def _ask_turn(client, question, conversation_id=None, image=True):
 def test_turn1_mints_conversation_id(client, fresh_conversations):
     res = _ask_turn(client, "What was revenue in 2024?")
     assert res.status_code == 200
-    cid = res.get_json().get("conversation_id")
+    body = res.get_json()
+    cid = body.get("conversation_id")
     assert cid  # a fresh id is returned so the client can send follow-ups
+    assert body["image_index"] == 1  # the first image is image 1
     # The conversation was seeded with the image + first turn.
-    assert fresh_conversations.get_image(cid) is not None
+    assert fresh_conversations.get_images(cid) == fresh_conversations.get_images(cid)  # stable
+    assert len(fresh_conversations.get_images(cid)) == 1
     assert len(fresh_conversations.get(cid)["messages"]) == 2  # user + assistant
 
 
@@ -406,7 +409,8 @@ def test_followup_threads_history_into_inference(client, fresh_conversations, mo
 
     captured = {}
 
-    def _fake_run_inference(image_bytes, question, history=None):
+    def _fake_run_inference(images, question, history=None):
+        captured["images"] = images
         captured["history"] = history
         return "42"
 
@@ -423,11 +427,14 @@ def test_followup_threads_history_into_inference(client, fresh_conversations, mo
     cid = first.get_json()["conversation_id"]
 
     _ask_turn(client, "And in 2023?", conversation_id=cid, image=False)
-    # Turn 2 threads the first exchange into the model.
+    # Turn 2 threads the first exchange into the model (the first user turn carries the
+    # index of the image it added).
     assert captured["history"] == [
-        {"role": "user", "text": "What was revenue in 2024?"},
+        {"role": "user", "text": "What was revenue in 2024?", "image_index": 1},
         {"role": "assistant", "text": "42"},
     ]
+    # Turn 2 added no new image, so inference still sees the single stored image.
+    assert len(captured["images"]) == 1
 
 
 def test_unknown_conversation_id_requires_image(client, fresh_conversations):
@@ -435,6 +442,60 @@ def test_unknown_conversation_id_requires_image(client, fresh_conversations):
     res = _ask_turn(client, "follow up?", conversation_id="deadbeef", image=False)
     assert res.status_code == 400
     assert "image" in res.get_json()["error"].lower()
+
+
+def test_second_image_added_and_both_fed_to_inference(client, fresh_conversations, monkeypatch):
+    # A follow-up that uploads a SECOND image: it's added as image 2, and inference
+    # receives BOTH images (numbered) so the user can ask about either.
+    import app as app_mod
+
+    captured = {}
+
+    def _fake_run_inference(images, question, history=None):
+        captured["images"] = images
+        return "42"
+
+    monkeypatch.setattr(app_mod, "is_mock", lambda: False)
+    monkeypatch.setattr(app_mod, "run_inference", _fake_run_inference)
+    monkeypatch.setattr(app_mod.answer_cache, "get", lambda *a, **k: None)
+    monkeypatch.setattr(app_mod.answer_cache, "put", lambda *a, **k: None)
+    monkeypatch.setattr(app_mod.budget, "over_budget", lambda: False)
+    monkeypatch.setattr(app_mod.budget, "record", lambda: None)
+    monkeypatch.setattr(app_mod.vlm_provider, "ensure_running", lambda *a, **k: True)
+
+    first = _ask_turn(client, "What is the max here?")
+    cid = first.get_json()["conversation_id"]
+    assert first.get_json()["image_index"] == 1
+
+    # Follow-up uploads a new image -> image 2, both images now fed to the VLM.
+    res = _ask_turn(client, "and in this one?", conversation_id=cid, image=True)
+    assert res.status_code == 200
+    assert res.get_json()["image_index"] == 2
+    assert len(captured["images"]) == 2
+    assert len(fresh_conversations.get_images(cid)) == 2
+
+
+def test_image_cap_trims_to_most_recent(client, fresh_conversations, monkeypatch):
+    import app as app_mod
+
+    captured = {}
+    monkeypatch.setattr(app_mod, "is_mock", lambda: False)
+    monkeypatch.setattr(app_mod, "run_inference",
+                        lambda images, q, history=None: captured.update(images=images) or "42")
+    monkeypatch.setattr(app_mod.answer_cache, "get", lambda *a, **k: None)
+    monkeypatch.setattr(app_mod.answer_cache, "put", lambda *a, **k: None)
+    monkeypatch.setattr(app_mod.budget, "over_budget", lambda: False)
+    monkeypatch.setattr(app_mod.budget, "record", lambda: None)
+    monkeypatch.setattr(app_mod.vlm_provider, "ensure_running", lambda *a, **k: True)
+    monkeypatch.setattr(app_mod, "CONVERSATION_MAX_IMAGES", 2)  # feed the VLM at most 2
+
+    first = _ask_turn(client, "question one?")
+    cid = first.get_json()["conversation_id"]
+    _ask_turn(client, "question two?", conversation_id=cid, image=True)
+    _ask_turn(client, "question three?", conversation_id=cid, image=True)
+    # 3 images stored, but only the most-recent 2 are fed to the VLM.
+    assert len(fresh_conversations.get_images(cid)) == 3
+    assert len(captured["images"]) == 2
 
 
 # --- Feedback endpoint (Phase 5 flywheel) ---

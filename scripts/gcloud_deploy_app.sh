@@ -190,7 +190,12 @@ fi
 BACKEND_ENV="USE_MOCK=${USE_MOCK},MOCK_DELAY_S=0,MOCK_REVEAL=0"
 BACKEND_ENV+=",VLM_URL=${VLM_URL},VLM_TIMEOUT=120,VLM_PROVIDER=${VLM_PROVIDER},VLM_AUTH=${VLM_AUTH}"
 BACKEND_ENV+=",QWEN_MODEL_ID=Qwen/Qwen3-VL-8B-Instruct,QWEN_ADAPTER_PATH=,QWEN_QUANTIZATION=none"
-BACKEND_ENV+=",QWEN_MAX_NEW_TOKENS=64,QWEN_ANSWER_SUFFIX= Please answer directly."
+# Chain-of-thought prompt (2026-07): raised token budget + a suffix that asks the model
+# to state the chart value(s) and compute step by step before a final "Answer:" line,
+# instead of "answer directly" (which skipped reasoning and produced wrong arithmetic on
+# comparison/difference questions). Comma-free on purpose — this whole string is one
+# --set-env-vars value; a literal comma would break gcloud's KEY=VALUE parsing.
+BACKEND_ENV+=",QWEN_MAX_NEW_TOKENS=128,QWEN_ANSWER_SUFFIX= If this needs a calculation such as a sum or a difference or a ratio: first state the relevant number(s) from the chart then compute step by step. Finish with a single line starting with 'Answer:' followed by ONLY the short final answer (1-10 words)."
 BACKEND_ENV+=",HOST=0.0.0.0,FLASK_DEBUG=0,CORS_ORIGINS=*,MAX_UPLOAD_MB=10,MIN_QUESTION_ALNUM=3"
 BACKEND_ENV+=",ANSWER_CACHE_ENABLED=1,ANSWER_CACHE_MAX=512,ANSWER_CACHE_TTL_S=3600"
 # Data layer + cost controls (3.6/3.7). REDIS_URL empty = in-memory per-instance fallback
@@ -216,7 +221,7 @@ BACKEND_ENV+=",AUTH_ENABLED=${AUTH_ENABLED},GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
 # Conversation memory (Phase 5): multi-turn chat store. Shares the same Redis as the cache
 # (REDIS_URL above) in prod; in-memory fallback per instance otherwise. 30-min idle TTL,
 # last 8 turns kept. These keys must be present — the backend has no in-code defaults.
-BACKEND_ENV+=",CONVERSATION_ENABLED=1,CONVERSATION_TTL_S=1800,CONVERSATION_MAX_TURNS=8"
+BACKEND_ENV+=",CONVERSATION_ENABLED=1,CONVERSATION_TTL_S=1800,CONVERSATION_MAX_TURNS=8,CONVERSATION_MAX_IMAGES=4"
 # Feedback flywheel (Phase 5): 👍/👎 -> GCS as a fine-tuning data source. Off unless
 # --feedback-bucket is given (fail-open: a broken write never breaks a request).
 BACKEND_ENV+=",FEEDBACK_ENABLED=${FEEDBACK_ENABLED},FEEDBACK_GCS_BUCKET=${FEEDBACK_BUCKET}"

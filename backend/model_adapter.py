@@ -71,26 +71,27 @@ def _load_model():
     )
 
 
-def predict(image_bytes: bytes, question: str, history: list | None = None) -> str:
-    """Return a short answer (1-10 words) for a chart image + question.
+def predict(images: list[bytes], question: str, history: list | None = None) -> str:
+    """Return a short answer (1-10 words) for chart image(s) + question.
 
     Routes to the remote VLM service when ``VLM_URL`` is set, else runs in-process.
-    The frontend/API contract is identical either way. ``history`` (prior
-    ``{"role", "text"}`` turns) continues a multi-turn conversation about the image.
+    The frontend/API contract is identical either way. ``images`` is the ordered list of
+    the conversation's charts (oldest -> newest); ``history`` (prior ``{"role", "text"}``
+    turns) continues a multi-turn conversation.
     """
     url = env_str("VLM_URL").strip()
     if url:
-        return _predict_remote(url, image_bytes, question, history)
-    return _predict_local(image_bytes, question, history)
+        return _predict_remote(url, images, question, history)
+    return _predict_local(images, question, history)
 
 
-def _predict_local(image_bytes: bytes, question: str, history: list | None = None) -> str:
+def _predict_local(images: list[bytes], question: str, history: list | None = None) -> str:
     """In-process inference: load Qwen3-VL once (cached) and generate here."""
     chat = _load_model()
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    pil_images = [Image.open(io.BytesIO(b)).convert("RGB") for b in images]
 
     answer = chat.chat(
-        image=image,
+        images=pil_images,
         text=question.strip() + env_str("QWEN_ANSWER_SUFFIX"),
         max_new_tokens=env_int("QWEN_MAX_NEW_TOKENS"),
         history=history,
@@ -100,9 +101,9 @@ def _predict_local(image_bytes: bytes, question: str, history: list | None = Non
 
 
 def _predict_remote(
-    url: str, image_bytes: bytes, question: str, history: list | None = None
+    url: str, images: list[bytes], question: str, history: list | None = None
 ) -> str:
-    """Delegate to a remote VLM service: POST ``{image, question[, history]}`` -> ``{answer}``.
+    """Delegate to a remote VLM service: POST ``{images, question[, history]}`` -> ``{answer}``.
 
     The service owns the model + generation config (suffix, max_new_tokens, "Answer:"
     stripping), so the contract stays tiny and the backend carries no ML deps. This is
@@ -113,7 +114,7 @@ def _predict_remote(
     Auth (``VLM_AUTH``) is shared logic — see ``gcp_auth.auth_header``.
     """
     payload = {
-        "image": base64.b64encode(image_bytes).decode("ascii"),
+        "images": [base64.b64encode(b).decode("ascii") for b in images],
         "question": question.strip(),
     }
     if history:

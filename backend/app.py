@@ -107,6 +107,10 @@ MIN_QUESTION_ALNUM = env_int("MIN_QUESTION_ALNUM")
 # (not just warn) — see chart_check.py / .env.example for why.
 CHART_BLOCK_THRESHOLD = env_float("CHART_BLOCK_THRESHOLD")
 
+# Max images (most-recent N) fed to the VLM per turn in a multi-image conversation. Caps
+# vision-token cost / latency; older images drop out of the numbered window.
+CONVERSATION_MAX_IMAGES = env_int("CONVERSATION_MAX_IMAGES")
+
 
 def _question_too_weak(question: str) -> bool:
     """Reject only near-empty / junk questions (e.g. "?", "hi").
@@ -237,10 +241,12 @@ def feedback():
         return jsonify(error="conversation_id is required."), 400
 
     state = conversation_store.get(conversation_id)
-    image_bytes = conversation_store.get_image(conversation_id)
-    if state is None or image_bytes is None:
+    images = conversation_store.get_images(conversation_id)
+    if state is None or not images:
         # The conversation expired or never existed — nothing to attach the vote to.
         return jsonify(error="Unknown or expired conversation."), 404
+    # Attach the most recent image — the most likely subject of the answer being rated.
+    image_bytes = images[-1]
 
     messages = state.get("messages", [])
     last_question = next((m["text"] for m in reversed(messages) if m["role"] == "user"), "")
@@ -289,7 +295,7 @@ def _prepare_ask():
     if _question_too_weak(question):
         return None, (jsonify(error="Please ask a more specific question."), 400)
 
-    # Resolve the conversation: a valid existing id makes this a follow-up whose image can
+    # Resolve the conversation: a valid existing id makes this a follow-up whose images
     # come from the store; anything else starts a fresh conversation needing an image.
     history: list = []
     is_followup = False
@@ -298,22 +304,21 @@ def _prepare_ask():
         is_followup = True
         history = stored_state.get("messages", [])
 
-    image_bytes = image.read() if (image is not None and image.filename != "") else b""
+    # A newly-uploaded image this turn (may be None on a follow-up that just asks). Raw
+    # here — it's sanitized + chart-gated + added to the store in _ask_events.
+    new_image = image.read() if (image is not None and image.filename != "") else b""
 
-    if not image_bytes:
-        if is_followup:
-            # Follow-up with no re-uploaded image: pull the pinned chart from the store.
-            image_bytes = conversation_store.get_image(conversation_id) or b""
-        if not image_bytes:
-            # Turn 1, or a follow-up whose stored image expired and wasn't re-sent.
-            return None, (jsonify(error="Please upload an image."), 400)
+    has_existing_images = is_followup and bool(conversation_store.get_images(conversation_id))
+    if not new_image and not has_existing_images:
+        # Turn 1, or a follow-up whose stored images expired and none was re-sent.
+        return None, (jsonify(error="Please upload an image."), 400)
 
     if not is_followup:
         conversation_id = conversation_store.new_id()
 
     prep = {
         "question": question,
-        "image_bytes": image_bytes,
+        "new_image": new_image,           # raw bytes of the image added THIS turn, or b""
         "rate_key": rate_key,
         "conversation_id": conversation_id,
         "history": history,
@@ -355,9 +360,14 @@ def _ask_events(prep: dict):
     prior ``history`` so follow-ups are grounded in the conversation; after answering,
     the turn is appended to the conversation store and ``conversation_id`` is returned in
     the result so the client can send it on the next turn.
+
+    Multi-image: a turn may upload a NEW chart. Only that new image is sanitized + chart-
+    gated (older ones already passed) and appended to the conversation's image list; the
+    VLM then receives ALL of the conversation's images (numbered, capped at
+    ``CONVERSATION_MAX_IMAGES``) so questions can reference "image 1", etc.
     """
     question = prep["question"]
-    image_bytes = prep["image_bytes"]
+    new_image = prep["new_image"]
     rate_key = prep["rate_key"]
     conversation_id = prep["conversation_id"]
     history = prep["history"]
@@ -370,48 +380,47 @@ def _ask_events(prep: dict):
                "status_code": 429}
         return
 
-    # Re-encode the upload from its decoded pixels: rejects non-images and strips any
-    # embedded/trailing payload, and yields canonical bytes for the cache key.
-    try:
-        image_bytes = sanitize_image(image_bytes)
-    except InvalidImage:
-        yield {"stage": "result", "body": {"error": "Uploaded file is not a valid image."},
-               "status_code": 400}
-        return
+    # Sanitize a newly-uploaded image (re-encode from decoded pixels: rejects non-images,
+    # strips any embedded/trailing payload). No new image on a plain follow-up.
+    if new_image:
+        try:
+            new_image = sanitize_image(new_image)
+        except InvalidImage:
+            yield {"stage": "result", "body": {"error": "Uploaded file is not a valid image."},
+                   "status_code": 400}
+            return
 
-    # Answer cache (real mode only): a repeat (image, question) short-circuits the guard,
-    # chart gate and VLM entirely. Never caches the mock disclaimer. Skipped for follow-up
-    # turns: the answer depends on the conversation history, so an (image, question) key
-    # alone would wrongly collide two follow-ups that share a question but differ in context.
+    # Answer cache (real mode only): a first-turn repeat (image, question) short-circuits
+    # the whole pipeline. Only safe on turn 1 with no history/prior images — a follow-up's
+    # answer depends on the conversation, so an (image, question) key would wrongly collide.
     if not is_mock() and not is_followup:
-        cached = answer_cache.get(image_bytes, question)
+        cached = answer_cache.get(new_image, question)
         metrics.count_cache(cached is not None)
         if cached is not None:
-            # Still seed the conversation on a turn-1 cache hit so follow-ups have both the
-            # pinned image and this first exchange in their history.
-            conversation_store.start(conversation_id, image_bytes)
-            conversation_store.append_turn(conversation_id, question, cached.get("answer", ""))
+            index = conversation_store.add_image(conversation_id, new_image)
+            conversation_store.append_turn(
+                conversation_id, question, cached.get("answer", ""), image_index=index
+            )
             yield {"stage": "result",
                    "body": {"mock": False, "cached": True, "latency_ms": 0.0,
-                            "conversation_id": conversation_id, **cached},
+                            "conversation_id": conversation_id, "image_index": index, **cached},
                    "status_code": 200}
             return
 
-    # --- Layer-2/3 guard (question) + Rule 4 chart gate (image) — run concurrently ---
-    # as_completed() (not future.result() in submission order) so each stage's "done"
-    # event fires the moment IT finishes, not after whichever we happen to check first
-    # — a naive `guard_future.result()` then `chart_future.result()` would make the
-    # SECOND-checked stage's measured elapsed_ms include the first stage's wait time
-    # too, even if the second stage actually finished first (caught via /metrics
-    # showing guard and chart_gate with near-identical, both-inflated sums, 2026-07-10).
+    # --- Layer-2/3 guard (question) + Rule 4 chart gate (only the NEW image) ---
+    # The guard runs every turn. The chart gate only runs when this turn added an image
+    # (older images already passed it). When both run they go CONCURRENTLY, harvested via
+    # as_completed() so each stage's measured elapsed_ms is its OWN wall time, not inflated
+    # by whichever future we happen to read first (caught via /metrics, 2026-07-10).
     yield {"stage": "guard", "status": "start", "elapsed_ms": None}
-    yield {"stage": "chart_gate", "status": "start", "elapsed_ms": None}
     stage_results = {}
+    gate_new_image = bool(new_image)
+    if gate_new_image:
+        yield {"stage": "chart_gate", "status": "start", "elapsed_ms": None}
     with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = {
-            pool.submit(_timed, guard, question): "guard",
-            pool.submit(_timed, looks_like_chart, image_bytes): "chart_gate",
-        }
+        futures = {pool.submit(_timed, guard, question): "guard"}
+        if gate_new_image:
+            futures[pool.submit(_timed, looks_like_chart, new_image)] = "chart_gate"
         for future in as_completed(futures):
             stage = futures[future]
             value, elapsed = future.result()
@@ -419,7 +428,9 @@ def _ask_events(prep: dict):
             metrics.observe_stage(stage, elapsed)
             yield {"stage": stage, "status": "done", "elapsed_ms": round(elapsed * 1000, 1)}
     verdict = stage_results["guard"]
-    is_chart, chart_confidence = stage_results["chart_gate"]
+    # is_chart/chart_confidence describe the newly-added image (or a neutral pass when this
+    # turn added none — the existing images were already gated when they were added).
+    is_chart, chart_confidence = stage_results.get("chart_gate", (True, 1.0))
 
     if not verdict.allowed:
         metrics.count_blocked(verdict.category)
@@ -428,14 +439,10 @@ def _ask_events(prep: dict):
                "status_code": 200}
         return
 
-    # Hard block when the gate is confident this ISN'T a chart — cheaper than the guard
-    # LLM and MUCH cheaper than the VLM, and the only content check on the IMAGE itself
-    # (guard() above only screens the question text, so an off-topic image with an
-    # innocuous question would otherwise reach the model — confirmed 2026-07-10: an
-    # unrelated photo got a bizarre off-topic answer instead of "not a chart"). A
-    # borderline image (below CHART_CLIP_THRESHOLD but above this) still proceeds with
-    # just the "may be unreliable" warning, so ambiguous-but-real charts aren't blocked.
-    if chart_confidence < CHART_BLOCK_THRESHOLD:
+    # Hard block a confidently-non-chart NEW image before the VLM (cheapest gate on the
+    # image itself; the guard only screens the question). Borderline images still proceed
+    # with just the "may be unreliable" warning, so ambiguous-but-real charts aren't blocked.
+    if gate_new_image and chart_confidence < CHART_BLOCK_THRESHOLD:
         metrics.count_blocked("not_a_chart")
         yield {"stage": "result",
                "body": {"blocked": True, "category": "not_a_chart",
@@ -443,6 +450,10 @@ def _ask_events(prep: dict):
                                   "chart image."},
                "status_code": 200}
         return
+
+    # The new image passed its gate — add it to the conversation now (before inference) so
+    # the VLM sees it in the numbered image list. Its 1-based index tags this user turn.
+    new_image_index = conversation_store.add_image(conversation_id, new_image) if new_image else None
 
     if not is_mock():
         # Daily VLM budget breaker (Phase 3.7): refuse *before* touching the GPU once the
@@ -467,9 +478,16 @@ def _ask_events(prep: dict):
                    "status_code": 503}
             return
 
+    # The full image set the VLM should see, capped to the most-recent N (numbered in the
+    # prompt so a question can reference "image 1"). Includes the just-added image.
+    images = conversation_store.get_images(conversation_id)
+    if not images and new_image:
+        images = [new_image]  # store disabled/fail-open: still answer about this turn's image
+    images = images[-CONVERSATION_MAX_IMAGES:] if CONVERSATION_MAX_IMAGES > 0 else images
+
     yield {"stage": "vlm", "status": "start", "elapsed_ms": None}
     start = time.perf_counter()
-    answer = run_inference(image_bytes, question, history=history or None)
+    answer = run_inference(images, question, history=history or None)
     inference_s = time.perf_counter() - start
     latency_ms = round(inference_s * 1000, 1)
     if not is_mock():
@@ -478,13 +496,9 @@ def _ask_events(prep: dict):
         budget.record()  # count this real invocation against today's budget
     yield {"stage": "vlm", "status": "done", "elapsed_ms": latency_ms}
 
-    # Seed the conversation on turn 1 (pins the image) and record this turn so the next
-    # follow-up has the full history. `answer` is the model's reply (mock or real); in the
-    # non-reveal mock path there's no meaningful answer to thread, so we still seed the
-    # image + question but store the canned answer as the assistant turn for continuity.
-    if not is_followup:
-        conversation_store.start(conversation_id, image_bytes)
-    conversation_store.append_turn(conversation_id, question, answer)
+    # Record this turn (with the index of any image it added) so the next follow-up has the
+    # full history. The image itself was already added to the store above (pre-inference).
+    conversation_store.append_turn(conversation_id, question, answer, image_index=new_image_index)
 
     # Rule 3: in mock mode return a disclaimer, never a fake answer — unless the
     # MOCK_REVEAL demo toggle is on, in which case show the canned answer.
@@ -492,18 +506,18 @@ def _ask_events(prep: dict):
         yield {"stage": "result",
                "body": {"disclaimer": MOCK_DISCLAIMER, "mock": True, "is_chart": is_chart,
                         "chart_confidence": chart_confidence, "latency_ms": latency_ms,
-                        "conversation_id": conversation_id},
+                        "conversation_id": conversation_id, "image_index": new_image_index},
                "status_code": 200}
         return
 
     result = {"answer": answer, "is_chart": is_chart, "chart_confidence": chart_confidence}
-    if not is_mock() and not is_followup:
-        # Only cache turn 1 — a follow-up's answer is history-dependent (see the cache
-        # lookup above), so caching it under an (image, question) key would be unsafe.
-        answer_cache.put(image_bytes, question, result)
+    if not is_mock() and not is_followup and new_image:
+        # Only cache a clean turn-1 (single image, no history) — a follow-up's or multi-
+        # image answer is context-dependent, so an (image, question) key would be unsafe.
+        answer_cache.put(new_image, question, result)
     yield {"stage": "result",
            "body": {"mock": is_mock(), "latency_ms": latency_ms,
-                    "conversation_id": conversation_id, **result},
+                    "conversation_id": conversation_id, "image_index": new_image_index, **result},
            "status_code": 200}
 
 

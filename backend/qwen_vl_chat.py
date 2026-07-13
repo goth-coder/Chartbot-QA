@@ -88,38 +88,62 @@ class QwenVLChat:
 
     @staticmethod
     def build_messages(
-        image,
-        text: str,
+        image=None,
+        text: str = "",
         system_prompt: str | None = None,
         answer: str | None = None,
         history: list | None = None,
+        images: list | None = None,
     ) -> list:
         """Build the chat `messages` structure for the Qwen processor.
 
         Shared by inference (`chat`) and training. Pass `answer` to append the
         assistant turn (used to build supervised training targets).
 
-        Pass `history` (a list of prior `{"role": "user"|"assistant", "text": str}`
-        turns, oldest first) for multi-turn chat about the same image. The image is
-        attached to the FIRST user turn only — Qwen re-reads it in context for the whole
-        conversation, so re-attaching it per turn would waste vision tokens. When
-        `history` is None/empty this is exactly the original single-turn behavior.
+        Images: pass a single `image` (URL, path, or PIL image) for the one-chart case, or
+        `images` (a list, oldest -> newest) for multi-chart conversations. With more than
+        one image they're presented up front, NUMBERED ("Image 1", "Image 2", …) in a
+        leading user turn, so a question can reference "image 1"; a short guidance line
+        tells the model the newest image is the default when none is named. With exactly
+        one image the output matches the original single-image prompt (no numbering), so
+        existing evals/tests don't shift. Images ride only in that leading turn — Qwen
+        re-reads them in context, so re-attaching per turn would waste vision tokens.
+
+        Pass `history` (prior `{"role": "user"|"assistant", "text": str}` turns, oldest
+        first) for multi-turn chat. When `history`/`images` are empty this is exactly the
+        original single-turn, single-image behavior.
         """
+        image_list = list(images) if images else ([image] if image is not None else [])
+
         messages = []
         if system_prompt:
             messages.append(
                 {"role": "system", "content": [{"type": "text", "text": system_prompt}]}
             )
 
-        # The image rides on whichever user turn comes first in the full sequence: the
-        # earliest history turn if there is one, otherwise the current turn.
-        image_attached = False
+        # Present all images once, numbered, in a leading user turn. For a single image we
+        # keep the classic "[image][question]" shape (no numbering) so nothing shifts.
+        if len(image_list) > 1:
+            lead = []
+            for i, img in enumerate(image_list, start=1):
+                lead.append({"type": "image", "image": img})
+                lead.append({"type": "text", "text": f"Image {i}"})
+            lead.append({"type": "text", "text": (
+                f"There are {len(image_list)} chart images above, numbered 1 to "
+                f"{len(image_list)}. Unless the question names a specific image, answer "
+                f"about Image {len(image_list)} (the most recent)."
+            )})
+            messages.append({"role": "user", "content": lead})
+            images_attached = True
+        else:
+            images_attached = False
 
         def _user_content(turn_text: str) -> list:
-            nonlocal image_attached
-            if not image_attached:
-                image_attached = True
-                return [{"type": "image", "image": image}, {"type": "text", "text": turn_text}]
+            nonlocal images_attached
+            if not images_attached and image_list:
+                images_attached = True
+                return [{"type": "image", "image": image_list[0]},
+                        {"type": "text", "text": turn_text}]
             return [{"type": "text", "text": turn_text}]
 
         for turn in history or []:
@@ -141,18 +165,22 @@ class QwenVLChat:
 
     def chat(
         self,
-        image,
-        text: str,
+        image=None,
+        text: str = "",
         system_prompt: str | None = None,
         max_new_tokens: int = 128,
         history: list | None = None,
+        images: list | None = None,
     ) -> str:
-        """Send an image + text (with optional system prompt) and return the reply.
+        """Send image(s) + text (with optional system prompt) and return the reply.
 
-        `image` accepts a URL, a local file path, or a PIL image. Pass `history` (prior
-        `{"role", "text"}` turns) to continue a multi-turn conversation about `image`.
+        Pass a single `image` (URL, path, or PIL image), or `images` (a list) for a
+        multi-chart conversation. Pass `history` (prior `{"role", "text"}` turns) to
+        continue a multi-turn conversation.
         """
-        messages = self.build_messages(image, text, system_prompt, history=history)
+        messages = self.build_messages(
+            image, text, system_prompt, history=history, images=images
+        )
 
         # Preparation for inference
         inputs = self.processor.apply_chat_template(

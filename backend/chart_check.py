@@ -20,9 +20,12 @@ Fails open everywhere: if nothing can decide, we assume it IS a chart
 from __future__ import annotations
 
 import io
+import logging
 from collections import Counter
 
 from env_config import env_float, env_int, env_str
+
+log = logging.getLogger("chart_check")
 
 # --- CLIP zero-shot stage ------------------------------------------------
 
@@ -74,7 +77,13 @@ _clip = None
 
 
 def _load_clip():
-    """Load CLIP once. Returns (model, processor, torch) or None if unavailable."""
+    """Load CLIP once. Returns (model, processor, torch) or None if unavailable.
+
+    Logs on both outcomes (2026-07 fix): a silent failure here means the gate quietly
+    drops from CLIP zero-shot to the much cruder pixel heuristic with no signal anywhere
+    that it happened — a real observability gap that made a live false "not a chart"
+    impossible to diagnose from logs alone.
+    """
     global _clip
     if _clip is not None:
         return _clip or None
@@ -86,8 +95,13 @@ def _load_clip():
         model.eval()
         processor = CLIPProcessor.from_pretrained(_CLIP_MODEL)
         _clip = (model, processor, torch)
+        log.info("Chart gate: CLIP model %s loaded.", _CLIP_MODEL)
         return _clip
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "Chart gate: CLIP model %s failed to load (%s) — falling back to the pixel "
+            "heuristic for every request until restart.", _CLIP_MODEL, exc
+        )
         _clip = False  # don't retry on every request
         return None
 
@@ -199,5 +213,11 @@ def looks_like_chart(image_bytes: bytes) -> tuple[bool, float]:
         # chart of country names, or small/anti-aliased axis ticks Tesseract misses. CLIP
         # recognizes chart *structure* reliably; the digit check was too brittle to gate
         # on. (_has_data_values is kept for optional confidence boosting / future use.)
-        return prob >= _CLIP_THRESHOLD, round(prob, 3)
+        is_chart = prob >= _CLIP_THRESHOLD
+        if not is_chart:
+            # Log every REJECTED verdict — this is exactly the case that's hard to debug
+            # from a live report ("it said not-a-chart") without knowing the real score.
+            log.info("Chart gate: CLIP P(chart)=%.3f < threshold %.2f -> rejected.",
+                      prob, _CLIP_THRESHOLD)
+        return is_chart, round(prob, 3)
     return _heuristic_chart(image_bytes)
