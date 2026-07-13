@@ -7,7 +7,7 @@
 # Usage:
 #   ./scripts/gcloud_deploy_app.sh [--project PROJECT] [--region REGION] [--vlm-url URL]
 #                                  [--guard-url URL] [--redis-url URL]
-#                                  [--google-client-id ID]
+#                                  [--google-client-id ID] [--feedback-bucket NAME]
 #
 #   --vlm-url URL          Point the backend at a deployed vlm_service (its Cloud Run URL
 #                           + /predict, e.g. https://chartqa-vlm-xxxx.run.app/predict —
@@ -37,6 +37,12 @@
 #                           VITE_GOOGLE_CLIENT_ID baked in (via frontend/cloudbuild.yaml)
 #                           so it renders the Google sign-in gate. Omit to deploy with no
 #                           login wall (AUTH_ENABLED=0, matches local dev default).
+#   --feedback-bucket NAME  GCS bucket for the 👍/👎 feedback flywheel (Phase 5). When
+#                           given, sets FEEDBACK_ENABLED=1 + FEEDBACK_GCS_BUCKET and grants
+#                           the backend SA roles/storage.objectAdmin on gs://NAME (needs a
+#                           backend SA, i.e. also pass --vlm-url/--guard-url). Create the
+#                           bucket first: gcloud storage buckets create gs://NAME. Omit to
+#                           accept votes but persist nothing (FEEDBACK_ENABLED=0).
 #
 # The frontend and backend are public (--allow-unauthenticated) — a public demo — but the
 # GPU and guard services are NOT (only this backend's SA can invoke them). The backend's
@@ -60,6 +66,7 @@ VLM_URL=""
 GUARD_URL=""
 REDIS_URL=""
 GOOGLE_CLIENT_ID=""
+FEEDBACK_BUCKET=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -69,6 +76,7 @@ while [[ $# -gt 0 ]]; do
     --guard-url) GUARD_URL="$2"; shift 2 ;;
     --redis-url) REDIS_URL="$2"; shift 2 ;;
     --google-client-id) GOOGLE_CLIENT_ID="$2"; shift 2 ;;
+    --feedback-bucket) FEEDBACK_BUCKET="$2"; shift 2 ;;
     -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 1 ;;
   esac
@@ -156,6 +164,29 @@ else
   echo "[deploy-app] no --google-client-id given: deploying with no login wall (AUTH_ENABLED=0)."
 fi
 
+if [[ -n "$FEEDBACK_BUCKET" ]]; then
+  FEEDBACK_ENABLED=1
+  echo "[deploy-app] feedback flywheel: FEEDBACK_ENABLED=1 (bucket=$FEEDBACK_BUCKET)"
+  # The backend writes 👍/👎 records + chart images to the bucket, so its service account
+  # needs object write access. Requires a backend SA (NEEDS_SA), which is only created when
+  # --vlm-url or --guard-url is passed. Grant objectAdmin on the bucket to that SA.
+  if [[ "$NEEDS_SA" -ne 1 ]]; then
+    echo "[deploy-app] ERROR: --feedback-bucket needs a backend service account, which is" >&2
+    echo "             only created with --vlm-url/--guard-url. Deploy real (not mock) to" >&2
+    echo "             use feedback, or omit --feedback-bucket." >&2
+    exit 1
+  fi
+  echo "[deploy-app] granting $SA_EMAIL roles/storage.objectAdmin on gs://$FEEDBACK_BUCKET..."
+  gcloud storage buckets add-iam-policy-binding "gs://$FEEDBACK_BUCKET" \
+    --project "$PROJECT" \
+    --member "serviceAccount:$SA_EMAIL" --role roles/storage.objectAdmin --quiet
+else
+  FEEDBACK_ENABLED=0
+  FEEDBACK_BUCKET=""   # keep env var present-but-empty (backend requires the key to exist)
+  echo "[deploy-app] no --feedback-bucket given: feedback endpoint accepts votes but"
+  echo "             persists nothing (FEEDBACK_ENABLED=0)."
+fi
+
 BACKEND_ENV="USE_MOCK=${USE_MOCK},MOCK_DELAY_S=0,MOCK_REVEAL=0"
 BACKEND_ENV+=",VLM_URL=${VLM_URL},VLM_TIMEOUT=120,VLM_PROVIDER=${VLM_PROVIDER},VLM_AUTH=${VLM_AUTH}"
 BACKEND_ENV+=",QWEN_MODEL_ID=Qwen/Qwen3-VL-8B-Instruct,QWEN_ADAPTER_PATH=,QWEN_QUANTIZATION=none"
@@ -182,6 +213,13 @@ BACKEND_ENV+=",CHART_SAMPLE_SIZE=128,CHART_MIN_BACKGROUND_RATIO=0.18,CHART_MAX_D
 # dev. GOOGLE_CLIENT_ID is public (it's the OAuth audience, not a secret) — safe as a
 # plain env var, same as everything else here.
 BACKEND_ENV+=",AUTH_ENABLED=${AUTH_ENABLED},GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}"
+# Conversation memory (Phase 5): multi-turn chat store. Shares the same Redis as the cache
+# (REDIS_URL above) in prod; in-memory fallback per instance otherwise. 30-min idle TTL,
+# last 8 turns kept. These keys must be present — the backend has no in-code defaults.
+BACKEND_ENV+=",CONVERSATION_ENABLED=1,CONVERSATION_TTL_S=1800,CONVERSATION_MAX_TURNS=8"
+# Feedback flywheel (Phase 5): 👍/👎 -> GCS as a fine-tuning data source. Off unless
+# --feedback-bucket is given (fail-open: a broken write never breaks a request).
+BACKEND_ENV+=",FEEDBACK_ENABLED=${FEEDBACK_ENABLED},FEEDBACK_GCS_BUCKET=${FEEDBACK_BUCKET}"
 
 echo "[deploy-app] deploying backend to Cloud Run..."
 gcloud run deploy "$BACKEND_SERVICE" \
@@ -205,7 +243,7 @@ echo "  build time, see frontend/cloudbuild.yaml)..."
 gcloud builds submit frontend --project "$PROJECT" \
   --config frontend/cloudbuild.yaml \
   --substitutions="_IMAGE=${FRONTEND_IMAGE},_VITE_GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}"
-
+  
 echo "[deploy-app] deploying frontend to Cloud Run (proxies /api -> $BACKEND_URL)..."
 gcloud run deploy "$FRONTEND_SERVICE" \
   --project "$PROJECT" --region "$REGION" \

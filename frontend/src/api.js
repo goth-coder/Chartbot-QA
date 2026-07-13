@@ -50,10 +50,16 @@ export async function askQuestion(imageFile, question, { signal, token } = {}) {
 // or {stage: "result", body, status_code} exactly once at the end. Browsers' native
 // EventSource only supports GET, so this uses fetch() + a manual stream reader
 // instead — the only way to POST (the image) and still stream the response.
-export async function askQuestionStream(imageFile, question, { signal, token, onEvent } = {}) {
+// `conversationId` continues a multi-turn chat (Phase 5): pass it on follow-ups and the
+// image can be omitted (the backend re-hydrates the pinned chart from its store). On
+// turn 1 leave it null and send the image. The result body includes `conversation_id`.
+export async function askQuestionStream(
+  imageFile, question, { signal, token, onEvent, conversationId } = {}
+) {
   const form = new FormData()
-  form.append('image', imageFile)
+  if (imageFile) form.append('image', imageFile) // omitted on follow-ups (server has it)
   form.append('question', question)
+  if (conversationId) form.append('conversation_id', conversationId)
 
   let res
   try {
@@ -125,4 +131,27 @@ export async function getHealth() {
 // ping just means the first /api/ask absorbs the full cold-start latency instead.
 export function warmVlm(token) {
   fetch('/api/vlm/warm', { headers: authHeaders(token) }).catch(() => {})
+}
+
+// Same idea for the remote Layer-3 guard (Llama Guard on Ollama, its own scale-to-zero
+// service). Warming it at page load / sign-in hides its ~15-18s cold model load behind
+// the user's think-time, so the first question doesn't wait ~90s on a cold guard.
+export function warmGuard(token) {
+  fetch('/api/guard/warm', { headers: authHeaders(token) }).catch(() => {})
+}
+
+// Record a 👍/👎 on the latest answer in a conversation (Phase 5 flywheel). Best-effort:
+// resolves true on success, false on any failure — the UI shows the vote optimistically
+// and a failed persist just isn't worth interrupting the user for.
+export async function sendFeedback({ conversationId, vote, note, token } = {}) {
+  try {
+    const res = await fetch('/api/feedback', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+      body: JSON.stringify({ conversation_id: conversationId, vote, note: note || '' }),
+    })
+    return res.ok
+  } catch {
+    return false
+  }
 }

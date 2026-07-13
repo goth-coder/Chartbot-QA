@@ -51,6 +51,8 @@ from flask_cors import CORS
 import answer_cache
 import auth
 import budget
+import conversation_store
+import feedback_store
 import metrics
 import ratelimit
 import vlm_provider
@@ -183,16 +185,94 @@ def vlm_warm():
     return jsonify(status="ok")
 
 
+@app.get("/api/guard/warm")
+def guard_warm():
+    """Fire-and-forget nudge for the remote Layer-3 guard (Llama Guard on Ollama, a
+    separate scale-to-zero Cloud Run service). The frontend calls this alongside
+    /api/vlm/warm right after sign-in / page load, so the guard's cold start
+    (container spin-up + ~15-18s model load) happens during the user's think-time
+    instead of blocking their first question by ~90s.
+
+    guard_llm.warmup() blocks for the whole cold load, so run it in a daemon thread and
+    return immediately. No-op in mock mode and when the guard LLM is disabled/unavailable
+    (warmup() itself guards those). Gated like /api/ask — no warming for anonymous visitors."""
+    if (resp := _require_auth()) is not None:
+        return resp
+    if not is_mock():
+        threading.Thread(target=_guard_warm_bg, daemon=True).start()
+    return jsonify(status="ok")
+
+
+def _guard_warm_bg() -> None:
+    """Warm only the remote Layer-3 LLM (the ~90s cold-start surface). The in-process
+    Layer-2 encoders are already warmed at boot (gunicorn.conf.py post_worker_init), so
+    this deliberately does NOT call guard.warmup() — just the Ollama round-trip."""
+    try:
+        import guard_llm
+        guard_llm.warmup()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+@app.post("/api/feedback")
+def feedback():
+    """Record a 👍/👎 on an assistant answer (Phase 5 data flywheel). Re-hydrates the
+    chart image + the answer being rated from the conversation store and hands them to
+    feedback_store (fire-and-forget → GCS). Gated like /api/ask.
+
+    Body (JSON or form): ``conversation_id`` (required), ``vote`` in {"up","down"}
+    (required), optional ``note``. Returns 200 immediately — persistence is best-effort;
+    the vote is telemetry, not something whose durability the user should wait on."""
+    if (resp := _require_auth()) is not None:
+        return resp
+
+    data = request.get_json(silent=True) or request.form
+    conversation_id = (data.get("conversation_id") or "").strip()
+    vote = (data.get("vote") or "").strip().lower()
+    note = (data.get("note") or "").strip()
+
+    if vote not in ("up", "down"):
+        return jsonify(error="vote must be 'up' or 'down'."), 400
+    if not conversation_id:
+        return jsonify(error="conversation_id is required."), 400
+
+    state = conversation_store.get(conversation_id)
+    image_bytes = conversation_store.get_image(conversation_id)
+    if state is None or image_bytes is None:
+        # The conversation expired or never existed — nothing to attach the vote to.
+        return jsonify(error="Unknown or expired conversation."), 404
+
+    messages = state.get("messages", [])
+    last_question = next((m["text"] for m in reversed(messages) if m["role"] == "user"), "")
+    last_answer = next((m["text"] for m in reversed(messages) if m["role"] == "assistant"), "")
+
+    feedback_store.record(
+        conversation_id=conversation_id,
+        question=last_question,
+        model_answer=last_answer,
+        vote=vote,
+        note=note,
+        image_bytes=image_bytes,
+    )
+    return jsonify(status="ok")
+
+
 def _prepare_ask():
     """Auth + Layer-1 validation shared by /api/ask and /api/ask/stream — identical
     checks, run once, so the two endpoints can never drift apart on what they accept.
 
-    Returns ``(question, image_bytes, rate_key, None)`` on success, or
-    ``(None, None, None, (body, status))`` with a ready-to-return Flask response on
-    the first failure.
+    Multi-turn (Phase 5): an optional ``conversation_id`` form field continues an existing
+    chat. On turn 1 (no id) an image is required and a fresh id is minted; on a follow-up
+    (valid id) the image is OPTIONAL — it's re-hydrated from the conversation store — but
+    the client may still re-send it (e.g. if the store expired). The question is always
+    required and screened by the guard on every turn.
+
+    Returns ``(prep, None)`` on success where ``prep`` is a dict
+    ``{question, image_bytes, rate_key, conversation_id, history, is_followup}``, or
+    ``(None, (body, status))`` with a ready-to-return Flask response on the first failure.
     """
     if (resp := _require_auth()) is not None:
-        return None, None, None, resp
+        return None, resp
 
     # Rate limit key: the signed-in user when auth is on (more precise than an IP a
     # bot can spoof via X-Forwarded-For), else client IP (AUTH_ENABLED=0).
@@ -201,20 +281,45 @@ def _prepare_ask():
 
     question = (request.form.get("question") or "").strip()
     image = request.files.get("image")
+    conversation_id = (request.form.get("conversation_id") or "").strip()
 
     # --- Layer-1 guard: cheap rules, no ML (see docs/PLAN.md §6) ---
-    if image is None or image.filename == "":
-        return None, None, None, (jsonify(error="Please upload an image."), 400)
     if not question:
-        return None, None, None, (jsonify(error="Please type a question."), 400)
+        return None, (jsonify(error="Please type a question."), 400)
     if _question_too_weak(question):
-        return None, None, None, (jsonify(error="Please ask a more specific question."), 400)
+        return None, (jsonify(error="Please ask a more specific question."), 400)
 
-    image_bytes = image.read()
+    # Resolve the conversation: a valid existing id makes this a follow-up whose image can
+    # come from the store; anything else starts a fresh conversation needing an image.
+    history: list = []
+    is_followup = False
+    stored_state = conversation_store.get(conversation_id) if conversation_id else None
+    if stored_state is not None:
+        is_followup = True
+        history = stored_state.get("messages", [])
+
+    image_bytes = image.read() if (image is not None and image.filename != "") else b""
+
     if not image_bytes:
-        return None, None, None, (jsonify(error="Uploaded image is empty."), 400)
+        if is_followup:
+            # Follow-up with no re-uploaded image: pull the pinned chart from the store.
+            image_bytes = conversation_store.get_image(conversation_id) or b""
+        if not image_bytes:
+            # Turn 1, or a follow-up whose stored image expired and wasn't re-sent.
+            return None, (jsonify(error="Please upload an image."), 400)
 
-    return question, image_bytes, rate_key, None
+    if not is_followup:
+        conversation_id = conversation_store.new_id()
+
+    prep = {
+        "question": question,
+        "image_bytes": image_bytes,
+        "rate_key": rate_key,
+        "conversation_id": conversation_id,
+        "history": history,
+        "is_followup": is_followup,
+    }
+    return prep, None
 
 
 def _timed(fn, *args):
@@ -228,8 +333,11 @@ def _timed(fn, *args):
     return result, time.perf_counter() - t0
 
 
-def _ask_events(question: str, image_bytes: bytes, rate_key: str):
+def _ask_events(prep: dict):
     """The whole /api/ask pipeline, as a generator of progress events.
+
+    ``prep`` is the dict from :func:`_prepare_ask`
+    (``question, image_bytes, rate_key, conversation_id, history, is_followup``).
 
     Yields ``{"stage": <name>, "status": "start"|"done", "elapsed_ms": <float|None>}``
     for each stage, ending with exactly one
@@ -242,7 +350,19 @@ def _ask_events(question: str, image_bytes: bytes, rate_key: str):
     allocation this doesn't buy true CPU parallelism, but it does overlap each
     stage's I/O waits (the Layer-3 guard's HTTP round-trip, the chart gate's
     Tesseract OCR subprocess) instead of paying for them back-to-back.
+
+    Multi-turn (Phase 5): the guard runs on EVERY turn's question; the VLM receives the
+    prior ``history`` so follow-ups are grounded in the conversation; after answering,
+    the turn is appended to the conversation store and ``conversation_id`` is returned in
+    the result so the client can send it on the next turn.
     """
+    question = prep["question"]
+    image_bytes = prep["image_bytes"]
+    rate_key = prep["rate_key"]
+    conversation_id = prep["conversation_id"]
+    history = prep["history"]
+    is_followup = prep["is_followup"]
+
     if not ratelimit.allow(rate_key):
         metrics.count_rate_limited()
         yield {"stage": "result",
@@ -260,13 +380,20 @@ def _ask_events(question: str, image_bytes: bytes, rate_key: str):
         return
 
     # Answer cache (real mode only): a repeat (image, question) short-circuits the guard,
-    # chart gate and VLM entirely. Never caches the mock disclaimer.
-    if not is_mock():
+    # chart gate and VLM entirely. Never caches the mock disclaimer. Skipped for follow-up
+    # turns: the answer depends on the conversation history, so an (image, question) key
+    # alone would wrongly collide two follow-ups that share a question but differ in context.
+    if not is_mock() and not is_followup:
         cached = answer_cache.get(image_bytes, question)
         metrics.count_cache(cached is not None)
         if cached is not None:
+            # Still seed the conversation on a turn-1 cache hit so follow-ups have both the
+            # pinned image and this first exchange in their history.
+            conversation_store.start(conversation_id, image_bytes)
+            conversation_store.append_turn(conversation_id, question, cached.get("answer", ""))
             yield {"stage": "result",
-                   "body": {"mock": False, "cached": True, "latency_ms": 0.0, **cached},
+                   "body": {"mock": False, "cached": True, "latency_ms": 0.0,
+                            "conversation_id": conversation_id, **cached},
                    "status_code": 200}
             return
 
@@ -342,7 +469,7 @@ def _ask_events(question: str, image_bytes: bytes, rate_key: str):
 
     yield {"stage": "vlm", "status": "start", "elapsed_ms": None}
     start = time.perf_counter()
-    answer = run_inference(image_bytes, question)
+    answer = run_inference(image_bytes, question, history=history or None)
     inference_s = time.perf_counter() - start
     latency_ms = round(inference_s * 1000, 1)
     if not is_mock():
@@ -351,29 +478,41 @@ def _ask_events(question: str, image_bytes: bytes, rate_key: str):
         budget.record()  # count this real invocation against today's budget
     yield {"stage": "vlm", "status": "done", "elapsed_ms": latency_ms}
 
+    # Seed the conversation on turn 1 (pins the image) and record this turn so the next
+    # follow-up has the full history. `answer` is the model's reply (mock or real); in the
+    # non-reveal mock path there's no meaningful answer to thread, so we still seed the
+    # image + question but store the canned answer as the assistant turn for continuity.
+    if not is_followup:
+        conversation_store.start(conversation_id, image_bytes)
+    conversation_store.append_turn(conversation_id, question, answer)
+
     # Rule 3: in mock mode return a disclaimer, never a fake answer — unless the
     # MOCK_REVEAL demo toggle is on, in which case show the canned answer.
     if is_mock() and not MOCK_REVEAL:
         yield {"stage": "result",
                "body": {"disclaimer": MOCK_DISCLAIMER, "mock": True, "is_chart": is_chart,
-                        "chart_confidence": chart_confidence, "latency_ms": latency_ms},
+                        "chart_confidence": chart_confidence, "latency_ms": latency_ms,
+                        "conversation_id": conversation_id},
                "status_code": 200}
         return
 
     result = {"answer": answer, "is_chart": is_chart, "chart_confidence": chart_confidence}
-    if not is_mock():
+    if not is_mock() and not is_followup:
+        # Only cache turn 1 — a follow-up's answer is history-dependent (see the cache
+        # lookup above), so caching it under an (image, question) key would be unsafe.
         answer_cache.put(image_bytes, question, result)
     yield {"stage": "result",
-           "body": {"mock": is_mock(), "latency_ms": latency_ms, **result},
+           "body": {"mock": is_mock(), "latency_ms": latency_ms,
+                    "conversation_id": conversation_id, **result},
            "status_code": 200}
 
 
 @app.post("/api/ask")
 def ask():
-    question, image_bytes, rate_key, err = _prepare_ask()
+    prep, err = _prepare_ask()
     if err is not None:
         return err
-    for event in _ask_events(question, image_bytes, rate_key):
+    for event in _ask_events(prep):
         if event["stage"] == "result":
             return jsonify(**event["body"]), event["status_code"]
     return jsonify(error="Internal error."), 500  # pragma: no cover — _ask_events always yields a result
@@ -386,7 +525,7 @@ def ask_stream():
     POST (not GET) because the body carries the image — browsers' native EventSource
     only supports GET, so the frontend consumes this with fetch() + a stream reader
     instead (see frontend/src/api.js askQuestionStream)."""
-    question, image_bytes, rate_key, err = _prepare_ask()
+    prep, err = _prepare_ask()
     if err is not None:
         body, status = err
         # Mirror the same failure as a single SSE result event, so the frontend's
@@ -397,7 +536,7 @@ def ask_stream():
         )
 
     def _sse():
-        for event in _ask_events(question, image_bytes, rate_key):
+        for event in _ask_events(prep):
             yield f"data: {json.dumps(event)}\n\n"
 
     return Response(_sse(), mimetype="text/event-stream", headers={

@@ -89,26 +89,47 @@ class QwenVLChat:
         text: str,
         system_prompt: str | None = None,
         answer: str | None = None,
+        history: list | None = None,
     ) -> list:
         """Build the chat `messages` structure for the Qwen processor.
 
         Shared by inference (`chat`) and training. Pass `answer` to append the
         assistant turn (used to build supervised training targets).
+
+        Pass `history` (a list of prior `{"role": "user"|"assistant", "text": str}`
+        turns, oldest first) for multi-turn chat about the same image. The image is
+        attached to the FIRST user turn only — Qwen re-reads it in context for the whole
+        conversation, so re-attaching it per turn would waste vision tokens. When
+        `history` is None/empty this is exactly the original single-turn behavior.
         """
         messages = []
         if system_prompt:
             messages.append(
                 {"role": "system", "content": [{"type": "text", "text": system_prompt}]}
             )
-        messages.append(
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": image},
-                    {"type": "text", "text": text},
-                ],
-            }
-        )
+
+        # The image rides on whichever user turn comes first in the full sequence: the
+        # earliest history turn if there is one, otherwise the current turn.
+        image_attached = False
+
+        def _user_content(turn_text: str) -> list:
+            nonlocal image_attached
+            if not image_attached:
+                image_attached = True
+                return [{"type": "image", "image": image}, {"type": "text", "text": turn_text}]
+            return [{"type": "text", "text": turn_text}]
+
+        for turn in history or []:
+            role = turn.get("role")
+            turn_text = turn.get("text", "")
+            if role == "user":
+                messages.append({"role": "user", "content": _user_content(turn_text)})
+            elif role == "assistant":
+                messages.append(
+                    {"role": "assistant", "content": [{"type": "text", "text": turn_text}]}
+                )
+
+        messages.append({"role": "user", "content": _user_content(text)})
         if answer is not None:
             messages.append(
                 {"role": "assistant", "content": [{"type": "text", "text": answer}]}
@@ -121,12 +142,14 @@ class QwenVLChat:
         text: str,
         system_prompt: str | None = None,
         max_new_tokens: int = 128,
+        history: list | None = None,
     ) -> str:
         """Send an image + text (with optional system prompt) and return the reply.
 
-        `image` accepts a URL, a local file path, or a PIL image.
+        `image` accepts a URL, a local file path, or a PIL image. Pass `history` (prior
+        `{"role", "text"}` turns) to continue a multi-turn conversation about `image`.
         """
-        messages = self.build_messages(image, text, system_prompt)
+        messages = self.build_messages(image, text, system_prompt, history=history)
 
         # Preparation for inference
         inputs = self.processor.apply_chat_template(

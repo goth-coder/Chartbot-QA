@@ -25,6 +25,15 @@ RUN ollama serve & \
 # GUARD_LLM_TIMEOUT.
 ENV OLLAMA_LLM_LIBRARY=cpu
 
+# Keep the model resident for the life of the instance. Ollama's default unloads a model
+# after 5 minutes idle, so on a bursty demo the SECOND request after a lull pays a full
+# ~15-18s re-load even when the container itself is still warm. OLLAMA_KEEP_ALIVE=-1
+# disables that idle-unload; the 1B model stays in RAM until the instance scales to zero,
+# so once warmed (at boot / via the /api/guard/warm ping) every subsequent request within
+# the instance's life hits a warm model (~0.5-1.2s). Costs nothing extra — the instance is
+# already billed while alive; this just avoids re-loading into memory it already holds.
+ENV OLLAMA_KEEP_ALIVE=-1
+
 # Override the base image's ENTRYPOINT/CMD (["/bin/ollama"] ["serve"], hardcoded to
 # :11434) with a shell wrapper honoring $PORT — same reasoning as vlm_service/Dockerfile:
 # Cloud Run injects PORT (usually 8080) and requires the container to listen on exactly

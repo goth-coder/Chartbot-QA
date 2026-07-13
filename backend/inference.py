@@ -33,27 +33,29 @@ MOCK_DELAY_S = env_float("MOCK_DELAY_S")
 _MOCK_ANSWERS = ["4.2B", "2018", "37%", "Yes", "No", "About 1,200", "Q3", "12.5%"]
 
 
-def run_inference(image_bytes: bytes, question: str) -> str:
+def run_inference(image_bytes: bytes, question: str, history: list | None = None) -> str:
     """Return a short answer (1-10 words) for a chart image + question.
 
     Args:
         image_bytes: Raw bytes of the uploaded chart image.
         question: The natural-language question about the chart.
+        history: Prior ``{"role", "text"}`` turns for a multi-turn conversation about
+            the same image (None for a single-shot ask).
 
     Returns:
         A short string answer.
     """
     if USE_MOCK:
         return _mock_answer(image_bytes, question)
-    return _real_answer(image_bytes, question)
+    return _real_answer(image_bytes, question, history)
 
 
-def _real_answer(image_bytes: bytes, question: str) -> str:
+def _real_answer(image_bytes: bytes, question: str, history: list | None = None) -> str:
     """Call the model team's adapter. Imported lazily so the backend boots
     in mock mode without any heavy ML dependencies installed."""
     from model_adapter import predict  # local import on purpose
 
-    return predict(image_bytes, question)
+    return predict(image_bytes, question, history)
 
 
 def _mock_answer(image_bytes: bytes, question: str) -> str:

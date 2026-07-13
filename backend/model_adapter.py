@@ -71,19 +71,20 @@ def _load_model():
     )
 
 
-def predict(image_bytes: bytes, question: str) -> str:
+def predict(image_bytes: bytes, question: str, history: list | None = None) -> str:
     """Return a short answer (1-10 words) for a chart image + question.
 
     Routes to the remote VLM service when ``VLM_URL`` is set, else runs in-process.
-    The frontend/API contract is identical either way.
+    The frontend/API contract is identical either way. ``history`` (prior
+    ``{"role", "text"}`` turns) continues a multi-turn conversation about the image.
     """
     url = env_str("VLM_URL").strip()
     if url:
-        return _predict_remote(url, image_bytes, question)
-    return _predict_local(image_bytes, question)
+        return _predict_remote(url, image_bytes, question, history)
+    return _predict_local(image_bytes, question, history)
 
 
-def _predict_local(image_bytes: bytes, question: str) -> str:
+def _predict_local(image_bytes: bytes, question: str, history: list | None = None) -> str:
     """In-process inference: load Qwen3-VL once (cached) and generate here."""
     chat = _load_model()
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -92,13 +93,16 @@ def _predict_local(image_bytes: bytes, question: str) -> str:
         image=image,
         text=question.strip() + env_str("QWEN_ANSWER_SUFFIX"),
         max_new_tokens=env_int("QWEN_MAX_NEW_TOKENS"),
+        history=history,
     )
     # If the model echoes an "Answer:" prefix (CoT-style prompts), keep the tail.
     return answer.split("Answer:")[-1].strip()
 
 
-def _predict_remote(url: str, image_bytes: bytes, question: str) -> str:
-    """Delegate to a remote VLM service: POST ``{image, question}`` -> ``{answer}``.
+def _predict_remote(
+    url: str, image_bytes: bytes, question: str, history: list | None = None
+) -> str:
+    """Delegate to a remote VLM service: POST ``{image, question[, history]}`` -> ``{answer}``.
 
     The service owns the model + generation config (suffix, max_new_tokens, "Answer:"
     stripping), so the contract stays tiny and the backend carries no ML deps. This is
@@ -112,6 +116,8 @@ def _predict_remote(url: str, image_bytes: bytes, question: str) -> str:
         "image": base64.b64encode(image_bytes).decode("ascii"),
         "question": question.strip(),
     }
+    if history:
+        payload["history"] = history
     headers = gcp_auth.auth_header(url, env_str("VLM_AUTH"))
     resp = requests.post(url, json=payload, headers=headers, timeout=env_float("VLM_TIMEOUT"))
     resp.raise_for_status()

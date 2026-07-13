@@ -342,3 +342,132 @@ def test_auth_required_gates_vlm_warm(client, monkeypatch):
     monkeypatch.setattr(auth, "AUTH_ENABLED", True)
     res = client.get("/api/vlm/warm")
     assert res.status_code == 401
+
+
+def test_auth_required_gates_guard_warm(client, monkeypatch):
+    import auth
+
+    monkeypatch.setattr(auth, "AUTH_ENABLED", True)
+    res = client.get("/api/guard/warm")
+    assert res.status_code == 401
+
+
+def test_guard_warm_returns_ok_without_auth(client):
+    # In mock mode (the test client), the warm is a no-op but must still return 200 fast.
+    res = client.get("/api/guard/warm")
+    assert res.status_code == 200
+    assert res.get_json()["status"] == "ok"
+
+
+# --- Multi-turn conversation contract (Phase 5) ---
+
+@pytest.fixture()
+def fresh_conversations():
+    import conversation_store
+    conversation_store.reset()
+    yield conversation_store
+    conversation_store.reset()
+
+
+def _ask_turn(client, question, conversation_id=None, image=True):
+    data = {"question": question}
+    if image:
+        data["image"] = (_png_bytes(), "chart.png")
+    if conversation_id is not None:
+        data["conversation_id"] = conversation_id
+    return client.post("/api/ask", data=data, content_type="multipart/form-data")
+
+
+def test_turn1_mints_conversation_id(client, fresh_conversations):
+    res = _ask_turn(client, "What was revenue in 2024?")
+    assert res.status_code == 200
+    cid = res.get_json().get("conversation_id")
+    assert cid  # a fresh id is returned so the client can send follow-ups
+    # The conversation was seeded with the image + first turn.
+    assert fresh_conversations.get_image(cid) is not None
+    assert len(fresh_conversations.get(cid)["messages"]) == 2  # user + assistant
+
+
+def test_followup_reuses_stored_image_without_reupload(client, fresh_conversations):
+    first = _ask_turn(client, "What was revenue in 2024?")
+    cid = first.get_json()["conversation_id"]
+    # Follow-up sends ONLY the conversation_id + question, no image.
+    res = _ask_turn(client, "And in 2023?", conversation_id=cid, image=False)
+    assert res.status_code == 200
+    assert res.get_json()["conversation_id"] == cid
+    # History now has both turns (2 user + 2 assistant).
+    assert len(fresh_conversations.get(cid)["messages"]) == 4
+
+
+def test_followup_threads_history_into_inference(client, fresh_conversations, monkeypatch):
+    # Force the real (non-mock) inference path so we can observe the history argument,
+    # stubbing run_inference at its boundary (not faking the endpoint logic).
+    import app as app_mod
+
+    captured = {}
+
+    def _fake_run_inference(image_bytes, question, history=None):
+        captured["history"] = history
+        return "42"
+
+    monkeypatch.setattr(app_mod, "is_mock", lambda: False)
+    monkeypatch.setattr(app_mod, "run_inference", _fake_run_inference)
+    monkeypatch.setattr(app_mod.answer_cache, "get", lambda *a, **k: None)
+    monkeypatch.setattr(app_mod.answer_cache, "put", lambda *a, **k: None)
+    monkeypatch.setattr(app_mod.budget, "over_budget", lambda: False)
+    monkeypatch.setattr(app_mod.budget, "record", lambda: None)
+    monkeypatch.setattr(app_mod.vlm_provider, "ensure_running", lambda *a, **k: True)
+
+    first = _ask_turn(client, "What was revenue in 2024?")
+    assert captured["history"] is None  # turn 1 has no prior history
+    cid = first.get_json()["conversation_id"]
+
+    _ask_turn(client, "And in 2023?", conversation_id=cid, image=False)
+    # Turn 2 threads the first exchange into the model.
+    assert captured["history"] == [
+        {"role": "user", "text": "What was revenue in 2024?"},
+        {"role": "assistant", "text": "42"},
+    ]
+
+
+def test_unknown_conversation_id_requires_image(client, fresh_conversations):
+    # A stale/unknown id with no image is treated as a fresh turn-1 that needs an image.
+    res = _ask_turn(client, "follow up?", conversation_id="deadbeef", image=False)
+    assert res.status_code == 400
+    assert "image" in res.get_json()["error"].lower()
+
+
+# --- Feedback endpoint (Phase 5 flywheel) ---
+
+def test_feedback_records_vote_for_known_conversation(client, fresh_conversations, monkeypatch):
+    import app as app_mod
+
+    captured = {}
+    monkeypatch.setattr(app_mod.feedback_store, "record", lambda **kw: captured.update(kw))
+
+    first = _ask_turn(client, "What was revenue in 2024?")
+    cid = first.get_json()["conversation_id"]
+    res = client.post("/api/feedback", json={"conversation_id": cid, "vote": "down", "note": "wrong"})
+    assert res.status_code == 200
+    assert captured["conversation_id"] == cid
+    assert captured["vote"] == "down"
+    assert captured["note"] == "wrong"
+    assert captured["question"] == "What was revenue in 2024?"
+    assert captured["image_bytes"]  # the pinned chart image was re-hydrated
+
+
+def test_feedback_rejects_bad_vote(client, fresh_conversations):
+    res = client.post("/api/feedback", json={"conversation_id": "x", "vote": "maybe"})
+    assert res.status_code == 400
+
+
+def test_feedback_unknown_conversation_returns_404(client, fresh_conversations):
+    res = client.post("/api/feedback", json={"conversation_id": "nope", "vote": "up"})
+    assert res.status_code == 404
+
+
+def test_feedback_gated_by_auth(client, monkeypatch):
+    import auth
+    monkeypatch.setattr(auth, "AUTH_ENABLED", True)
+    res = client.post("/api/feedback", json={"conversation_id": "x", "vote": "up"})
+    assert res.status_code == 401

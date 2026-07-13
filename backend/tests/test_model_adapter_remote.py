@@ -73,9 +73,10 @@ def test_predict_stays_in_process_when_vlm_url_empty(monkeypatch):
     captured = {}
 
     class _FakeChat:
-        def chat(self, image, text, max_new_tokens):
+        def chat(self, image, text, max_new_tokens, history=None):
             captured["text"] = text
             captured["max_new_tokens"] = max_new_tokens
+            captured["history"] = history
             return "Answer: local-7"
 
     monkeypatch.setattr(model_adapter, "_load_model", lambda: _FakeChat())

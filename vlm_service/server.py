@@ -69,11 +69,16 @@ def predict():
     data = request.get_json(silent=True) or {}
     image_b64 = data.get("image")
     question = (data.get("question") or "").strip()
+    # Optional multi-turn history: prior [{"role","text"}] turns about the SAME image.
+    # The image is attached only to the first user turn (build_messages handles that).
+    history = data.get("history") or None
     if not image_b64 or not question:
         return jsonify(error="Both 'image' (base64) and 'question' are required."), 400
 
     image = Image.open(io.BytesIO(base64.b64decode(image_b64))).convert("RGB")
-    raw = _CHAT.chat(image=image, text=question + _SUFFIX, max_new_tokens=_MAX_NEW_TOKENS)
+    raw = _CHAT.chat(
+        image=image, text=question + _SUFFIX, max_new_tokens=_MAX_NEW_TOKENS, history=history
+    )
     # Same post-processing as the in-process path so both modes return identical answers.
     answer = raw.split("Answer:")[-1].strip()
     return jsonify(answer=answer)

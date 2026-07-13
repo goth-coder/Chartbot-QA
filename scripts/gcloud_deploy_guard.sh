@@ -64,10 +64,18 @@ echo "[deploy-guard] deploying to Cloud Run (min-instances=0, scale-to-zero, PRI
 # flags), 2Gi is plenty for a 1B model. guard/Dockerfile's CMD honors $PORT (Cloud Run
 # injects it, usually 8080) instead of Ollama's hardcoded default :11434 — see the
 # Dockerfile comment for why that override was needed.
+#
+# --cpu-boost: give the container extra CPU during startup so the ~15-18s model load on a
+#   cold start finishes faster (the backend deploy already uses this — gcloud_deploy_app.sh).
+# --no-cpu-throttling: keep CPU allocated even between requests, so the model Ollama holds
+#   resident (OLLAMA_KEEP_ALIVE=-1, see guard/Dockerfile) isn't throttled to near-zero and
+#   the next request hits a genuinely warm model. Together with the keep-alive, this is what
+#   turns the ~90s cold-guard experience into a ~1-3s warm one WITHOUT pinning min-instances
+#   (idle cost stays $0 — the service still scales to zero).
 gcloud run deploy "$SERVICE" \
   --project "$PROJECT" --region "$REGION" \
   --image "$IMAGE" \
-  --cpu=2 --memory=2Gi \
+  --cpu=2 --memory=2Gi --cpu-boost --no-cpu-throttling \
   --min-instances=0 --max-instances=2 --concurrency=4 \
   --timeout=60 \
   --no-allow-unauthenticated

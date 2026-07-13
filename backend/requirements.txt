@@ -34,5 +34,9 @@ redis>=5.0,<6
 # private GPU/guard Cloud Run services (gcp_auth.py). Not optional/fail-open — when
 # AUTH_ENABLED=1 a broken verifier must reject, not silently allow.
 google-auth>=2.0,<3
+# Feedback flywheel (Phase 5, feedback_store.py): append 👍/👎 records + chart images to
+# GCS as a fine-tuning data source. Fail-open — with FEEDBACK_ENABLED=0 (default) or no
+# bucket configured this is never imported, so it's a light optional dependency.
+google-cloud-storage>=2.10,<4
 # Tests (test_chart_check.py) — run with: python -m pytest
 pytest>=8.0
