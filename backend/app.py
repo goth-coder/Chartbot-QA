@@ -33,6 +33,7 @@ Or via the root orchestrator:  python app.py
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -219,6 +220,11 @@ def get_conversation():
     history — the lookup is derived from the caller's own verified token, never a
     client-supplied id. Fail-open: no live conversation (never chatted, or it expired)
     is a normal 200 with conversation_id: null, not an error.
+
+    Each user message that added an image is returned with an ``image_data_uri`` (base64
+    PNG, sanitize_image's output format — see uploads.py) so the restored transcript can
+    show the chart bubbles it originally had, not just text. Images live in a separate
+    store key (conversation_images) fetched once here, not per message.
     """
     if (resp := _require_auth()) is not None:
         return resp
@@ -230,7 +236,14 @@ def get_conversation():
     state = conversation_store.get(conversation_id) if conversation_id else None
     if state is None:
         return jsonify(conversation_id=None, messages=[])
-    return jsonify(conversation_id=conversation_id, messages=state.get("messages", []))
+
+    messages = state.get("messages", [])
+    images = conversation_store.get_images(conversation_id)
+    for m in messages:
+        idx = m.get("image_index")
+        if idx and 1 <= idx <= len(images):
+            m["image_data_uri"] = "data:image/png;base64," + base64.b64encode(images[idx - 1]).decode("ascii")
+    return jsonify(conversation_id=conversation_id, messages=messages)
 
 
 def _guard_warm_bg() -> None:

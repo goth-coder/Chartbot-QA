@@ -539,6 +539,28 @@ def test_conversation_restored_for_same_user_after_a_turn(client, fresh_conversa
     assert len(body["messages"]) == 2  # user + assistant
 
 
+def test_conversation_restore_includes_the_image_as_a_data_uri(
+    client, fresh_conversations, monkeypatch
+):
+    headers = _auth_as(monkeypatch, "user-a")
+    first = client.post(
+        "/api/ask",
+        data={"question": "What was revenue in 2024?", "image": (_png_bytes(), "chart.png")},
+        content_type="multipart/form-data",
+        headers=headers,
+    )
+    assert first.status_code == 200
+
+    res = client.get("/api/conversation", headers=headers)
+    body = res.get_json()
+    user_turn = next(m for m in body["messages"] if m["role"] == "user")
+    assert user_turn["image_index"] == 1
+    assert user_turn["image_data_uri"].startswith("data:image/png;base64,")
+    # assistant turns never carry an image
+    assistant_turn = next(m for m in body["messages"] if m["role"] == "assistant")
+    assert "image_data_uri" not in assistant_turn
+
+
 def test_conversation_never_leaks_to_a_different_user(client, fresh_conversations, monkeypatch):
     headers_a = _auth_as(monkeypatch, "user-a")
     res = client.post(
