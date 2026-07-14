@@ -358,7 +358,7 @@ function App() {
       <nav className="nav-bar">
         <span className="brand">
           <span className="brand-glyph" aria-hidden="true">⚡</span>
-          <span className="brand-name">Chart&nbsp;VQA</span>
+          <span className="brand-name">Chartbot&nbsp;QA</span>
         </span>
         <span className={`status-pill ${mockBanner ? 'is-mock' : 'is-live'}`}>
           <span className="status-dot" aria-hidden="true" />
@@ -366,7 +366,7 @@ function App() {
         </span>
         {started && (
           <button type="button" className="signout" onClick={resetConversation}>
-            New chart
+            New session
           </button>
         )}
         {HAS_AUTH && token && (
@@ -379,11 +379,12 @@ function App() {
       <main className="container">
         {!started && (
           <header className="hero">
-            <p className="eyebrow">CHART QUESTION ANSWERING</p>
-            <h1 className="hero-title">Chat with a chart.</h1>
+            <p className="eyebrow">CHARTBOT QA</p>
+            <h1 className="hero-title">Chat with your charts.</h1>
             <p className="hero-sub">
-              Upload a chart, then ask follow-up questions about it. Powered by a
-              vision-language model behind <code className="chip">POST /api/ask</code>.
+              Upload a chart, then keep asking — follow-up questions, new charts, the same
+              conversation. Powered by a vision-language model behind{' '}
+              <code className="chip">POST /api/ask</code>.
             </p>
           </header>
         )}

@@ -1,10 +1,10 @@
-# Chart-Visual-QA
+# Chartbot QA
 
-A **Visual Question Answering (VQA)** system for **charts**: give it a chart image and a
-natural-language question, get back a short answer (1–10 words) — as a one-shot API call
-or a **multi-turn chatbot** that remembers the conversation and the charts it's about. The
-project compares a zero-shot VLM baseline against a LoRA fine-tuned VLM on the **ChartQA**
-dataset.
+A **production-ready multimodal AI chatbot for multi-turn question answering over
+charts**: upload a chart image, then keep asking — follow-up questions, new charts, one
+continuous conversation, each answer a short 1–10 word response grounded in what's on
+screen. The project compares a zero-shot VLM baseline against a LoRA fine-tuned VLM on the
+**ChartQA** dataset.
 
 This repo ships the **webapp** (React UI + Flask API), built **mock-first**: the backend
 returns fake answers behind a stable API contract so the UI and the safety layers can be
@@ -12,7 +12,7 @@ built and tested before the model is ready. Swapping in the real model touches a
 function (`backend/model_adapter.py::predict`). See [docs/PLAN.md](docs/PLAN.md) for the
 full plan and [docs/ROBUSTNESS.md](docs/ROBUSTNESS.md) for the guard design.
 
-![Chart VQA answering a real question against a live Qwen3-VL-8B model — chart detected 99%, answer "0.08"](docs/app-demo.png)
+![Chartbot QA answering a real question against a live Qwen3-VL-8B model — chart detected 99%, answer "0.08"](docs/app-demo.png)
 
 ## What's built
 
@@ -87,7 +87,7 @@ Two ways to run — full design in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 ### Production (default) — containerized
 
 ```bash
-git clone <repo> && cd Chart-Visual-QA
+git clone <repo> && cd Chartbot-QA
 python app.py
 ```
 
@@ -352,7 +352,7 @@ Inference goes through one seam — the model team only touches **`backend/model
 ## Project layout
 
 ```
-Chart-Visual-QA/
+Chartbot-QA/
 ├── app.py                # orchestrator: prod (docker compose) / --dev (local venv) / --dev --runpod
 ├── docker-compose.yml    # prod stack: backend + guard + frontend + prometheus + grafana
 ├── .env.example           # config template -> copied to .env (gitignored) on first run
