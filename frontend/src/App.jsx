@@ -357,8 +357,11 @@ function App() {
               </div>
             )}
 
-            {/* Image picker / dropzone — only before an image is chosen */}
-            {!previewUrl && (
+            {/* Image picker / dropzone — turn-1 only. Once the conversation has started,
+                attaching a NEW image goes through the composer's attach button instead
+                (this big dropzone would otherwise reappear whenever previewUrl is cleared
+                after each send, which it is — the sent image lives in the message now). */}
+            {!started && !previewUrl && (
               <>
                 <button
                   type="button"

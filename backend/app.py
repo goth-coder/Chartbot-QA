@@ -63,6 +63,7 @@ from inference import is_mock, run_inference
 from uploads import InvalidImage, sanitize_image
 
 logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("app")
 
 # Demo toggle: when MOCK_REVEAL is on, mock mode returns the canned answer instead
 # of the disclaimer — useful for demoing the full UI. Off keeps Rule 3 (no fake
@@ -526,9 +527,13 @@ def ask():
     prep, err = _prepare_ask()
     if err is not None:
         return err
-    for event in _ask_events(prep):
-        if event["stage"] == "result":
-            return jsonify(**event["body"]), event["status_code"]
+    try:
+        for event in _ask_events(prep):
+            if event["stage"] == "result":
+                return jsonify(**event["body"]), event["status_code"]
+    except Exception:  # noqa: BLE001 — mirror the /api/ask/stream hardening (2026-07-13)
+        log.exception("Unhandled error in /api/ask pipeline.")
+        return jsonify(error="Something went wrong while answering. Please try again."), 500
     return jsonify(error="Internal error."), 500  # pragma: no cover — _ask_events always yields a result
 
 
@@ -550,8 +555,17 @@ def ask_stream():
         )
 
     def _sse():
-        for event in _ask_events(prep):
-            yield f"data: {json.dumps(event)}\n\n"
+        try:
+            for event in _ask_events(prep):
+                yield f"data: {json.dumps(event)}\n\n"
+        except Exception:  # noqa: BLE001
+            # Any unhandled error mid-pipeline (e.g. the VLM service itself erroring —
+            # model_adapter._predict_remote deliberately does NOT fail-open there) must
+            # still end the stream with a proper result event. Without this, the
+            # generator just dies and the client sees an opaque "connection lost"
+            # instead of an actionable error (caught live 2026-07-13).
+            log.exception("Unhandled error in /api/ask/stream pipeline.")
+            yield f"data: {json.dumps({'stage': 'result', 'body': {'error': 'Something went wrong while answering. Please try again.'}, 'status_code': 500})}\n\n"
 
     return Response(_sse(), mimetype="text/event-stream", headers={
         "Cache-Control": "no-cache",

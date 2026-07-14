@@ -266,6 +266,51 @@ def test_ask_stream_missing_question_returns_early_error(client):
     assert "error" in events[0]["body"]
 
 
+def test_ask_stream_unhandled_pipeline_error_ends_stream_cleanly(client, monkeypatch):
+    # A real production incident (2026-07-13): the remote VLM service returned an
+    # unexpected error and model_adapter._predict_remote raised (by design — it does NOT
+    # fail-open). That unhandled exception used to kill the SSE generator mid-stream with
+    # no final "result" event at all, which the frontend surfaced as an opaque
+    # "Connection lost before the answer arrived." Now any unhandled error inside the
+    # pipeline must still end the stream with ONE well-formed result event.
+    import app as app_mod
+
+    monkeypatch.setattr(app_mod, "is_mock", lambda: False)
+    monkeypatch.setattr(app_mod.answer_cache, "get", lambda *a, **k: None)
+    monkeypatch.setattr(app_mod.budget, "over_budget", lambda: False)
+    monkeypatch.setattr(app_mod.vlm_provider, "ensure_running", lambda *a, **k: True)
+
+    def _boom(images, question, history=None):
+        raise RuntimeError("simulated VLM 400")
+
+    monkeypatch.setattr(app_mod, "run_inference", _boom)
+
+    res, events = _ask_stream_events(client)
+    assert res.status_code == 200
+    assert len(events) >= 1
+    assert events[-1]["stage"] == "result"
+    assert events[-1]["status_code"] == 500
+    assert "error" in events[-1]["body"]
+
+
+def test_ask_unhandled_pipeline_error_returns_500(client, monkeypatch):
+    # Same hardening on the non-streaming endpoint.
+    import app as app_mod
+
+    monkeypatch.setattr(app_mod, "is_mock", lambda: False)
+    monkeypatch.setattr(app_mod.answer_cache, "get", lambda *a, **k: None)
+    monkeypatch.setattr(app_mod.budget, "over_budget", lambda: False)
+    monkeypatch.setattr(app_mod.vlm_provider, "ensure_running", lambda *a, **k: True)
+    monkeypatch.setattr(
+        app_mod, "run_inference",
+        lambda images, question, history=None: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    res = _ask(client)
+    assert res.status_code == 500
+    assert "error" in res.get_json()
+
+
 def test_rate_limit_returns_429(client, monkeypatch):
     # Enable the limiter with a tiny budget and confirm the (N+1)th request is refused.
     import ratelimit
