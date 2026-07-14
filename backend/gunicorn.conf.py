@@ -18,11 +18,20 @@ import threading
 
 workers = 1
 threads = 8
-timeout = 180  # >= VLM_TIMEOUT (120s default) + guard/chart-gate overhead, with margin
+timeout = 240  # >= VLM_TIMEOUT (200s default) + guard/chart-gate overhead, with margin
 graceful_timeout = 30
 
 
-def post_worker_init(worker):  # noqa: ARG001 — gunicorn's hook signature
-    from guard import warmup
+def _warmup_all():
+    from chart_check import warmup as warmup_chart_check
+    from guard import warmup as warmup_guard
 
-    threading.Thread(target=warmup, daemon=True).start()
+    # Sequential, not parallel: these are the two heaviest model groups (CLIP +
+    # toxicity/injection/PII/topic-check/guard-LLM) and used to race for CPU/memory
+    # when only guard's were warmed at boot and CLIP loaded lazily on first request.
+    warmup_chart_check()
+    warmup_guard()
+
+
+def post_worker_init(worker):  # noqa: ARG001 — gunicorn's hook signature
+    threading.Thread(target=_warmup_all, daemon=True).start()

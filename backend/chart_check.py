@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import io
 import logging
+import threading
 from collections import Counter
 
 from env_config import env_float, env_int, env_str, resolve_model_path
@@ -74,6 +75,10 @@ _MIN_DATA_DIGITS = env_int("CHART_MIN_DATA_DIGITS")  # min numeric chars for a r
 
 # Lazy singleton: None = not tried yet, False = unavailable, else (model, proc, torch).
 _clip = None
+# Guards first-use init: gunicorn runs this app with multiple threads (see
+# gunicorn.conf.py), so without a lock, concurrent first requests would each race into
+# _load_clip() and load/hold their own CLIP copy (~600MB each) at once.
+_clip_lock = threading.Lock()
 
 
 def _load_clip():
@@ -87,23 +92,37 @@ def _load_clip():
     global _clip
     if _clip is not None:
         return _clip or None
-    try:
-        import torch
-        from transformers import CLIPModel, CLIPProcessor
+    with _clip_lock:
+        if _clip is not None:  # another thread finished loading while we waited
+            return _clip or None
+        try:
+            import torch
+            from transformers import CLIPModel, CLIPProcessor
 
-        model = CLIPModel.from_pretrained(_CLIP_MODEL)
-        model.eval()
-        processor = CLIPProcessor.from_pretrained(_CLIP_MODEL)
-        _clip = (model, processor, torch)
-        log.info("Chart gate: CLIP model %s loaded.", _CLIP_MODEL)
-        return _clip
-    except Exception as exc:  # noqa: BLE001
-        log.warning(
-            "Chart gate: CLIP model %s failed to load (%s) — falling back to the pixel "
-            "heuristic for every request until restart.", _CLIP_MODEL, exc
-        )
-        _clip = False  # don't retry on every request
-        return None
+            model = CLIPModel.from_pretrained(_CLIP_MODEL)
+            model.eval()
+            processor = CLIPProcessor.from_pretrained(_CLIP_MODEL)
+            _clip = (model, processor, torch)
+            log.info("Chart gate: CLIP model %s loaded.", _CLIP_MODEL)
+            return _clip
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "Chart gate: CLIP model %s failed to load (%s) — falling back to the pixel "
+                "heuristic for every request until restart.", _CLIP_MODEL, exc
+            )
+            _clip = False  # don't retry on every request
+            return None
+
+
+def warmup() -> None:
+    """Pre-load the CLIP model off the request path (call at boot, in a thread).
+
+    Without this, CLIP loads lazily on the first real /api/ask request — racing
+    guard.warmup()'s background thread for CPU/memory while multiple gunicorn threads
+    could all hit the lazy singleton at once. Mirrors guard.warmup()'s pattern; wired
+    into the same boot-time warmup call in gunicorn.conf.py's post_worker_init.
+    """
+    _load_clip()
 
 
 def _clip_chart_prob(image_bytes: bytes):
