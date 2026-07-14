@@ -47,6 +47,15 @@ RUN python -c "from detoxify import Detoxify; Detoxify('original')" \
        pipeline('text-classification', \
                 model='protectai/deberta-v3-base-prompt-injection-v2', truncation=True)"
 
+# Pre-cache the topic-check embedding model (guard latency fix, 2026-07) — same reasoning
+# as above: without this, HF_HUB_OFFLINE=1 below means the model can NEVER load at
+# runtime, so topic_check would always fail-open (return None), silently defeating the
+# whole "skip Layer 3 when confident" optimization. Keep in sync with .env's
+# TOPIC_CHECK_MODEL; a non-default value re-downloads once (network required then).
+RUN python -c "from transformers import AutoModel, AutoTokenizer; \
+       AutoTokenizer.from_pretrained('sentence-transformers/all-MiniLM-L6-v2'); \
+       AutoModel.from_pretrained('sentence-transformers/all-MiniLM-L6-v2')"
+
 COPY --chown=appuser:appuser . .
 
 # All guard/CLIP weights are baked into the image above — never phone home to HF Hub at

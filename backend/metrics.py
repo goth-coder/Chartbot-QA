@@ -30,6 +30,12 @@ if _OK:
     # budget breaker tripping before the GPU is touched.
     _RATE_LIMITED = Counter("rate_limited_total", "Requests rejected by the per-IP rate limit")
     _OVER_BUDGET = Counter("vlm_over_budget_total", "Requests refused by the daily VLM budget breaker")
+    # Guard latency optimization (2026-07): Layer 3 (Llama Guard) skipped because the
+    # question was confidently clean + confidently on-topic per cheap checks alone.
+    # Watch this against guard_fail_open_total to confirm the real-traffic skip rate.
+    _GUARD_LAYER3_SKIPPED = Counter("guard_layer3_skipped_total",
+                                   "Requests where Layer 3 (Llama Guard) was skipped "
+                                   "because cheap checks were confident")
 
 
 def count_request(route: str, status: int) -> None:
@@ -62,6 +68,12 @@ def count_guard_fail_open(layer: str) -> None:
     """A guard layer allowed a request without screening (dependency/service missing)."""
     if _OK:
         _GUARD_FAIL_OPEN.labels(layer or "unknown").inc()
+
+
+def count_guard_layer3_skipped() -> None:
+    """Layer 3 (Llama Guard) was skipped: cheap checks alone were confident enough."""
+    if _OK:
+        _GUARD_LAYER3_SKIPPED.inc()
 
 
 def count_rate_limited() -> None:
