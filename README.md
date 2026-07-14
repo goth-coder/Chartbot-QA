@@ -1,8 +1,10 @@
 # Chart-Visual-QA
 
 A **Visual Question Answering (VQA)** system for **charts**: give it a chart image and a
-natural-language question, get back a short answer (1–10 words). The project compares a
-zero-shot VLM baseline against a LoRA fine-tuned VLM on the **ChartQA** dataset.
+natural-language question, get back a short answer (1–10 words) — as a one-shot API call
+or a **multi-turn chatbot** that remembers the conversation and the charts it's about. The
+project compares a zero-shot VLM baseline against a LoRA fine-tuned VLM on the **ChartQA**
+dataset.
 
 This repo ships the **webapp** (React UI + Flask API), built **mock-first**: the backend
 returns fake answers behind a stable API contract so the UI and the safety layers can be
@@ -15,26 +17,54 @@ full plan and [docs/ROBUSTNESS.md](docs/ROBUSTNESS.md) for the guard design.
 ## What's built
 
 - **Webapp** — React (Vite) UI + Flask API, mock-first behind a stable `/api/ask` contract,
-  real Qwen3-VL-8B (+LoRA) inference behind a single swap (`USE_MOCK=0`).
+  real Qwen3-VL-8B (+LoRA) inference behind a single swap (`USE_MOCK=0`). Streams per-stage
+  progress over SSE (`/api/ask/stream`) so the UI shows "verifying image → verifying
+  question → processing model" instead of one opaque wait.
+- **Multi-turn chatbot** (`conversation_store.py`) — a conversation can span several
+  questions and several chart images (ChatGPT-style: "and in image 2?"), server-side
+  history + images keyed by a `conversation_id`, Redis-backed (falls back to in-process,
+  fail-open) with a sliding-window trim and idle TTL. With **Google sign-in** on
+  (`AUTH_ENABLED=1`), each user's *current* conversation is also indexed by a **SHA-256
+  hash of their Google `sub`** (never the raw id) so it survives sign-out/sign-in and page
+  reloads, without ever leaking one account's chat to another.
 - **Layered input guard** — screens the question/image *before* the model
   ([docs/ROBUSTNESS.md](docs/ROBUSTNESS.md) §1):
   - **Layer 1** — cheap rules (empty/junk question, image present). Always on, no extra deps.
   - **Chart gate** — **CLIP zero-shot** detector ("is this a chart?") + an OCR "has data
     values" check (Tesseract), with a pixel-heuristic fallback when CLIP/torch isn't present.
   - **Layer 2** — small local encoder classifiers: toxicity, prompt-injection, PII.
+  - **Topic check** — an embedding-similarity classifier (MiniLM cosine similarity against
+    reference ChartQA questions) that flags off-topic questions cheaply.
   - **Layer 3** — **Llama Guard 3** as a semantic input boundary filter for unsafe content /
-    policy / jailbreak, over an **OpenAI-compatible API** (Ollama on CPU, or vLLM on GPU).
+    policy / jailbreak / off-topic, over an **OpenAI-compatible API** (Ollama on CPU, or
+    vLLM on GPU). **Conditionally skipped**: only when Layer 2 is confidently clean (well
+    below its block thresholds, not just under them) *and* the topic check is confident —
+    any ambiguity still routes to Llama Guard. This cascade is the dominant latency lever:
+    calling an LLM guard on every request was the single biggest cost in the whole pipeline.
   - Every layer is **fail-open**: if its model/service isn't available, the app still runs —
     it just allows the request and **logs a warning** so the gap is visible.
+- **Required Google sign-in** (optional, `AUTH_ENABLED=1`) — gates `/api/ask` and friends
+  behind a verified Google ID token (`backend/auth.py`); also the rate-limit key (more
+  precise than a spoofable IP) and the identity behind per-user conversation history above.
+- **Feedback flywheel** (`feedback_store.py`) — 👍/👎 on an answer, best-effort persisted to
+  GCS (question, answer, chart image, vote) as a future fine-tuning data source.
 - **Backend services** — `answer_cache.py` (fail-open LRU+TTL, short-circuits guard+chart+VLM
   on a repeat question), `uploads.py` (re-encodes/sanitizes every upload, rejects non-images),
-  `metrics.py` (fail-open Prometheus: per-stage latency, request/block/cache counters),
-  `vlm_provider.py` (the one place that decides "is the remote VLM running, should I start
-  it" — shared by the page-load warm call and the real `/api/ask` path, see *Deploy* below).
+  `metrics.py` (fail-open Prometheus: per-stage latency, request/block/cache/guard-skip
+  counters), `vlm_provider.py` (the one place that decides "is the remote VLM running, should
+  I start it" — shared by the page-load warm call and the real `/api/ask` path, see *Deploy*
+  below), `ratelimit.py` + `budget.py` (per-IP/per-user rate limit and a daily VLM-call cap).
 - **Containerized stack** — `docker-compose.yml` runs backend (Flask + CLIP + Tesseract +
   Layer-2 encoders), guard (Llama Guard 3 on CPU via Ollama), frontend (nginx serving the
   Vite build, templated so the same image works locally and on Cloud Run), and an optional
   Prometheus + Grafana observability pair with a provisioned dashboard.
+- **`backend-base` / `backend` image split** — the backend's heavy deps (torch/transformers)
+  and its three baked HF models (CLIP, prompt-injection, topic-check — all served only via
+  HF's Xet CDN, which Cloud Build can't reach) live in a rarely-rebuilt `backend-base`
+  Artifact Registry image; the deployed `backend` image is thin and `FROM` it, so a normal
+  code deploy rebuilds in ~2 minutes instead of reinstalling ML deps every time. Mirrors the
+  `vlm-base`/`vlm-service` split below. Build it once with
+  `scripts/gcloud_build_backend_base.sh` (see `backend/models/README.md`).
 - **GPU model serving, two environments, one `server.py`** (`vlm_service/`) — a small Flask
   wrapper around the shared `QwenVLChat` class, warm-loaded once at boot: **RunPod** pods
   for cheap SSH-accessible dev/debugging (`scripts/runpod_up.py` / `runpod_down.py`, a bare
@@ -66,6 +96,10 @@ CLIP + Tesseract + Layer-2 encoders, all baked into the image) and the **guard**
 (Llama Guard 3 on **CPU via Ollama**, model baked in), plus a **local Vite frontend**. On
 first run it creates `.env` from `.env.example`, runs `npm install`, builds the images (slow
 the first time — it compiles the ML stack), and starts everything. Open **http://localhost:5173**.
+`AUTH_ENABLED=0` and `USE_MOCK=1` by default in `.env.example` — no Google sign-in wall and
+no real model call, so the multi-turn chat UI works immediately with mock answers. Set
+`USE_MOCK=0` for real inference (needs `VLM_URL` or an in-process GPU) and `AUTH_ENABLED=1`
++ `GOOGLE_CLIENT_ID` to require sign-in and get per-user persisted chat history.
 
 **Prerequisites:** **Docker Desktop** (running) and **Node.js 18+**. **No GPU and no host
 Ollama** — the guard runs on CPU inside its container. If Docker isn't running, `app.py`
@@ -97,7 +131,12 @@ vars take precedence. Highlights:
 | `GUARD_LLM_ENABLED` | `1` | Layer-3 Llama Guard on; falls back + warns if unreachable |
 | `GUARD_LLM_URL` | `http://localhost:11434` | OpenAI-compatible guard endpoint (dev) |
 | `GUARD_LLM_MODEL` | `llama-guard3:1b` | guard model tag |
+| `TOPIC_CHECK_ENABLED` | `1` | embedding-similarity off-topic check (part of the Layer-3 skip cascade) |
 | `TESSERACT_CMD` | *(empty)* | path to the Tesseract binary; empty = use `PATH` |
+| `AUTH_ENABLED` | `0` | `1` requires Google sign-in on `/api/ask` and co.; needs `GOOGLE_CLIENT_ID` |
+| `CONVERSATION_ENABLED` | `1` | multi-turn chat state (history + images per `conversation_id`) |
+| `CONVERSATION_TTL_S` | `1800` | idle expiry for a conversation (refreshed on every turn) |
+| `REDIS_URL` | *(empty)* | shared cache/rate-limit/conversation state across instances; empty = in-memory |
 | `PORT` / `HOST` | `5000` / `127.0.0.1` | backend bind |
 
 In **production** (`python app.py`), `docker-compose.yml` **overrides** a few of these for the
@@ -107,39 +146,54 @@ backend container — `GUARD_LLM_URL=http://guard:11434` (the guard service), `H
 ## Architecture
 
 ```
-image + question
+image + question (+ optional Google ID token, + optional conversation_id)
       │
       ▼
- Input Guard   L1 rules → chart gate (CLIP + OCR) → L2 encoders → L3 Llama Guard   (fail-open)
+ (Auth)        AUTH_ENABLED=1 → verify Google ID token, else 401     (skipped if off)
+      │
+      ▼
+ Conversation  known conversation_id (or restored via the user's own token) → follow-up:
+               history + prior images re-hydrated; else: turn 1, image required
+      │
+      ▼
+ Input Guard   L1 rules → chart gate (CLIP + OCR) → L2 encoders + topic check
+      │                        │ both confident-clean/on-topic? skip ↓, else ↓
+      │                        ▼
+      │                   L3 Llama Guard (semantic safety + off-topic net)    (fail-open)
       │ allowed
       ▼
-answer_cache   repeat (image, question)? → short-circuit straight to the cached answer
+answer_cache   repeat, turn-1, no-history (image, question)? → short-circuit to cached answer
       │ miss
       ▼
    Model (VLM)   mock, OR in-process, OR HTTP to vlm_service (RunPod dev / Cloud Run prod)
       │
       ▼
- short answer
+ short answer  → appended to the conversation; conversation_id returned for the next turn
 ```
 
 In **production** this is CPU containers — **backend** (Flask + CLIP + Tesseract + L2),
 **guard** (Llama Guard), **frontend** (nginx) — wired by `docker-compose.yml`, plus the
 **GPU model service** (`vlm_service/`) reached over HTTP at `VLM_URL` (never in the CPU
-image). The CPU gatekeeper — guards + chart gate + cache — always runs; only a request that
-survives all of it ever reaches the billed GPU. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md),
-the [deploy validation report](docs/CPU_DEPLOY_REPORT.md), and *Deploy & MLOps* below.
+image). The CPU gatekeeper — auth + conversation + guards + chart gate + cache — always
+runs; only a request that survives all of it ever reaches the billed GPU. See
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), the
+[deploy validation report](docs/CPU_DEPLOY_REPORT.md), and *Deploy & MLOps* below.
 
-- **frontend/** — React + Vite UI (question box, image picker, answer display); nginx in prod.
-- **backend/** — Flask API (`/api/health`, `/api/ask`, `/api/vlm/warm`, `/metrics`), the
-  chart gate + layered guard, the answer cache, mock/remote inference routing.
+- **frontend/** — React + Vite UI: question box, image picker, multi-turn chat transcript,
+  Google sign-in, 👍/👎 feedback; nginx in prod.
+- **backend/** — Flask API (`/api/ask`, `/api/ask/stream`, `/api/conversation`,
+  `/api/feedback`, `/api/health`, `/metrics`), auth, the multi-turn conversation store, the
+  chart gate + layered guard, the answer cache, mock/remote inference routing. Deployed as
+  a thin image `FROM` the rarely-rebuilt `backend-base` (see *What's built*).
 - **guard/** — Dockerfile for the CPU Llama Guard (Ollama) image, model baked in.
 - **vlm_service/** — standalone GPU Flask service (Qwen3-VL-8B + LoRA), the real-model
   serving path — see *Deploy & MLOps*.
 - **modeling/** — the `chartqa` package: fine-tuning, evaluation, MLflow tracking — see
   *Deploy & MLOps*.
 - **scripts/** — deploy automation: `runpod_up.py`/`runpod_down.py` (dev GPU pods),
-  `gcloud_build_vlm_base.sh` (rare — the base+model image), `gcloud_deploy_vlm.sh`/
-  `gcloud_deploy_guard.sh`/`gcloud_deploy_app.sh` (Cloud Run, every deploy).
+  `gcloud_build_vlm_base.sh`/`gcloud_build_backend_base.sh` (rare — the two `*-base`
+  images), `gcloud_deploy_vlm.sh`/`gcloud_deploy_guard.sh`/`gcloud_deploy_app.sh` (Cloud
+  Run, every deploy).
 - **observability/** — Prometheus scrape config + a provisioned Grafana dashboard.
 - **app.py** — orchestrator: `python app.py` (prod, Docker) / `python app.py --dev` (local) /
   `python app.py --dev --runpod` (local + a real GPU model on a RunPod dev pod).
@@ -212,7 +266,8 @@ scale to zero and are locked down so only the backend can reach them.
                                                    └──────────────────────┘
 
  chartqa-backend also talks to Upstash Redis (rediss://, external) for rate-limit /
- daily VLM budget / answer-cache counters shared across backend instances.
+ daily VLM budget / answer-cache / conversation-history state shared across backend
+ instances, and to Google's OAuth2 endpoints to verify sign-in ID tokens.
 ```
 
 - **Public** (`--allow-unauthenticated`): `chartqa-frontend`, `chartqa-backend` — the demo
@@ -236,13 +291,23 @@ Base URL (dev): `http://127.0.0.1:5000`
 | Method | Path | Body | Response |
 | --- | --- | --- | --- |
 | GET | `/api/health` | — | `{ "status": "ok", "mock": true }` |
-| POST | `/api/ask` | `multipart/form-data`: `image=<file>`, `question=<string>` | `{ "answer"\|"disclaimer": "...", "mock": true, "is_chart": true, "chart_confidence": 0.99, "latency_ms": 0.0 }` |
+| POST | `/api/ask` | `multipart/form-data`: `image=<file>` (optional on a follow-up), `question=<string>`, `conversation_id=<string>` (optional) | `{ "answer"\|"disclaimer": "...", "mock": true, "is_chart": true, "chart_confidence": 0.99, "latency_ms": 0.0, "conversation_id": "...", "image_index": 1 }` |
+| POST | `/api/ask/stream` | same body as `/api/ask` | `text/event-stream`: one `data: {"stage": ..., "status": "start"\|"done", ...}` line per pipeline stage, ending with `{"stage": "result", "body": <the /api/ask JSON above>, "status_code": 200}` — same pipeline, real-time progress |
+| GET | `/api/conversation` | — (auth required) | `{ "conversation_id": "..."\|null, "messages": [...] }` — the signed-in user's current conversation, if any |
+| POST | `/api/feedback` | JSON/form: `conversation_id`, `vote` (`"up"\|"down"`), `note` (optional) | `{ "status": "ok" }` — best-effort, fire-and-forget |
+| GET | `/api/vlm/warm`, `/api/guard/warm` | — (auth required) | `{ "status": "ok" }` — fire-and-forget nudge so a scale-to-zero service's cold start overlaps the user's think-time |
+| GET | `/metrics` | — | Prometheus text format |
 
-In **mock mode** (default), `/api/ask` returns a `disclaimer` instead of a fake `answer` (set
-`MOCK_REVEAL=1` to get the canned answer, or `USE_MOCK=0` for the real model). If the guard
-**blocks** the question it returns **HTTP 200** with
+`image` is **required on turn 1**, optional on a follow-up (the backend re-hydrates prior
+images from the conversation store by `conversation_id`) — omit both `image` and
+`conversation_id` and, when signed in, the backend transparently resumes *your own* most
+recent conversation. In **mock mode** (default), `/api/ask` returns a `disclaimer` instead
+of a fake `answer` (set `MOCK_REVEAL=1` to get the canned answer, or `USE_MOCK=0` for the
+real model). If the guard **blocks** the question it returns **HTTP 200** with
 `{ "blocked": true, "category": "...", "reason": "..." }`. Bad input returns `400` with
-`{ "error": "..." }`. Uploads are capped at `MAX_UPLOAD_MB` (10 MB).
+`{ "error": "..." }`. Uploads are capped at `MAX_UPLOAD_MB` (10 MB). When `AUTH_ENABLED=1`,
+every endpoint above except `/api/health` and `/metrics` requires
+`Authorization: Bearer <Google ID token>` and returns `401` without one.
 
 ```bash
 curl http://127.0.0.1:5000/api/health
@@ -292,26 +357,34 @@ Chart-Visual-QA/
 ├── docker-compose.yml    # prod stack: backend + guard + frontend + prometheus + grafana
 ├── .env.example           # config template -> copied to .env (gitignored) on first run
 ├── backend/
-│   ├── Dockerfile         # Flask + CLIP + Tesseract + L2 encoders (models baked in)
-│   ├── app.py             # Flask API: /api/health, /api/ask, /api/vlm/warm, /metrics
-│   ├── env_config.py      # required-env helpers (no in-code config defaults)
-│   ├── inference.py       # run_inference() seam; mock vs real (USE_MOCK)
-│   ├── model_adapter.py   # predict() landing spot: in-process or HTTP to vlm_service
-│   ├── vlm_provider.py    # shared "is the remote VLM running, should I start it" logic
-│   ├── answer_cache.py    # fail-open LRU+TTL cache, short-circuits guard+chart+VLM
-│   ├── uploads.py         # image re-encode/sanitize before anything else touches it
-│   ├── metrics.py         # fail-open Prometheus: per-stage latency + counters
-│   ├── chart_check.py     # chart gate: CLIP zero-shot + OCR "has data", heuristic fallback
-│   ├── guard.py           # Layer 2 orchestrator (toxicity / injection / PII) + warmup()
-│   ├── guard_llm.py       # Layer 3: Llama Guard over the OpenAI /v1 API (Ollama / vLLM)
-│   └── tests/             # pytest: API contract, guard logic, vendor-sync, quantization config
+│   ├── Dockerfile          # THIN: FROM backend-base, just the app source (fast rebuilds)
+│   ├── Dockerfile.base     # heavy deps (torch/transformers) + baked HF models; rebuilt rarely
+│   ├── app.py              # Flask API: /api/ask(/stream), /api/conversation, /api/feedback, ...
+│   ├── auth.py             # Google ID token verification (AUTH_ENABLED)
+│   ├── conversation_store.py  # multi-turn history + images + per-user restore index (Redis/in-mem)
+│   ├── env_config.py       # required-env helpers (no in-code config defaults)
+│   ├── inference.py        # run_inference() seam; mock vs real (USE_MOCK)
+│   ├── model_adapter.py    # predict() landing spot: in-process or HTTP to vlm_service
+│   ├── vlm_provider.py     # shared "is the remote VLM running, should I start it" logic
+│   ├── answer_cache.py     # fail-open LRU+TTL cache, short-circuits guard+chart+VLM
+│   ├── ratelimit.py / budget.py  # per-IP/user rate limit + daily VLM-call cap
+│   ├── uploads.py          # image re-encode/sanitize before anything else touches it
+│   ├── feedback_store.py   # 👍/👎 flywheel, best-effort persisted to GCS
+│   ├── metrics.py          # fail-open Prometheus: per-stage latency + counters
+│   ├── chart_check.py      # chart gate: CLIP zero-shot + OCR "has data", heuristic fallback
+│   ├── guard.py            # Layer 2 orchestrator (toxicity / injection / PII) + warmup()
+│   ├── guard_llm.py        # Layer 3: Llama Guard over the OpenAI /v1 API (Ollama / vLLM)
+│   ├── topic_check.py      # embedding-similarity off-topic classifier (part of the L3-skip cascade)
+│   ├── models/             # gitignored: CLIP/injection/topic-check weights baked into backend-base
+│   └── tests/              # pytest: API contract, guard logic, vendor-sync, quantization config
 ├── guard/          # CPU Llama Guard via Ollama, model baked into the image
-├── frontend/       # React + Vite app; nginx.conf.template (envsubst'd: local + Cloud Run)
+├── frontend/       # React + Vite app (chat UI, Google sign-in); nginx.conf.template (local + Cloud Run)
 ├── vlm_service/    # GPU model service (Qwen3-VL-8B+LoRA): server.py + TWO images —
 │                   #   Dockerfile.base (deps+model, built rarely) and the thin
 │                   #   Dockerfile (FROM base, code/adapter/config, built every deploy)
 ├── modeling/       # chartqa package: fine-tuning, evaluation, MLflow tracking, quant study
-├── scripts/        # runpod_up.py/runpod_down.py, gcloud_build_vlm_base.sh (rare),
+├── scripts/        # runpod_up.py/runpod_down.py, gcloud_build_vlm_base.sh /
+│                   #   gcloud_build_backend_base.sh (rare — the two *-base images),
 │                   #   gcloud_deploy_vlm.sh/gcloud_deploy_guard.sh/gcloud_deploy_app.sh
 ├── observability/  # Prometheus config + provisioned Grafana dashboard
 └── docs/           # ARCHITECTURE.md, ROBUSTNESS.md, REVIEW_AND_ROADMAP.md, RUNPOD_NOTES.md, ...
