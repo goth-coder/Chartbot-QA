@@ -38,8 +38,7 @@
 
 .brand-glyph {
   color: var(--primary);
-  font-size: 18px;
-  line-height: 1;
+  flex-shrink: 0;
 }
 
 .brand-name {
@@ -88,44 +87,25 @@
 }
 
 /* ── Layout ──────────────────────────────────────────────────────── */
+/* Fills whatever width the side panel leaves — no max-width — so the chat uses the
+   available background instead of floating in a fixed 720px column with empty space
+   beside it. A generous cap keeps line lengths sane on ultra-wide monitors. */
 .container {
   display: flex;
   flex-direction: column;
   flex: 1;
   min-height: 0; /* let children shrink below their content size instead of overflowing .page */
   width: 100%;
-  max-width: 720px;
+  max-width: 1400px;
   margin: 0 auto;
-  padding: var(--s-5xl) var(--s-3xl) var(--s-6xl);
+  padding: var(--s-3xl);
 }
 
-/* ── Hero ────────────────────────────────────────────────────────── */
-.hero {
-  margin-bottom: var(--s-4xl);
-}
-
-.eyebrow {
-  margin: 0 0 var(--s-lg);
-  font-size: 14px;
-  font-weight: 600;
-  letter-spacing: 2.52px;
-  color: var(--primary);
-}
-
-.hero-title {
-  margin: 0;
-  font-size: 60px;
-  font-weight: 400;
-  line-height: 60px;
-  letter-spacing: -0.65px;
-  color: var(--ink-strong);
-}
-
+/* Short description shown in the side panel before a conversation starts (see nav-bar). */
 .hero-sub {
-  margin: var(--s-xl) 0 0;
-  max-width: 52ch;
-  font-size: 18px;
-  line-height: 28px;
+  margin: 0;
+  font-size: 13px;
+  line-height: 20px;
   color: var(--body);
 }
 
@@ -504,16 +484,16 @@
 .chart-header {
   display: flex;
   align-items: center;
-  gap: var(--s-lg);
-  padding: var(--s-md);
+  gap: var(--s-xl);
+  padding: var(--s-lg);
   background-color: var(--canvas-soft);
   border: 1px solid var(--hairline);
   border-radius: var(--r-sm);
 }
 
 .chart-thumb {
-  width: 96px;
-  height: 72px;
+  width: 220px;
+  height: 165px;
   object-fit: cover;
   border-radius: var(--r-sm);
   border: 1px solid var(--hairline);
@@ -579,6 +559,13 @@
 
 .transcript-end {
   height: 0;
+}
+
+/* Stand-in for .transcript before any message exists, so the composer is still pushed to
+   the bottom of .chat-card instead of sitting right under the chart preview/picker. */
+.transcript-spacer {
+  flex: 1;
+  min-height: 120px;
 }
 
 .bubble {

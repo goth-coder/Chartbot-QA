@@ -357,13 +357,21 @@ function App() {
     <div className="page">
       <nav className="nav-bar">
         <span className="brand">
-          <span className="brand-glyph" aria-hidden="true">⚡</span>
+          <svg className="brand-glyph" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+            <rect x="4" y="13" width="4" height="7" rx="0.8" fill="currentColor" />
+            <rect x="10" y="9" width="4" height="11" rx="0.8" fill="currentColor" />
+            <rect x="16" y="4" width="4" height="16" rx="0.8" fill="currentColor" />
+          </svg>
           <span className="brand-name">Chartbot&nbsp;QA</span>
         </span>
         <span className={`status-pill ${mockBanner ? 'is-mock' : 'is-live'}`}>
           <span className="status-dot" aria-hidden="true" />
           {mockBanner ? 'mock backend' : 'live'}
         </span>
+        {!started && (
+          <p className="hero-sub">Upload a chart, then keep asking — follow-up questions,
+            the same conversation.</p>
+        )}
         {started && (
           <button type="button" className="signout" onClick={resetConversation}>
             New session
@@ -377,18 +385,6 @@ function App() {
       </nav>
 
       <main className="container">
-        {!started && (
-          <header className="hero">
-            <p className="eyebrow">CHARTBOT QA</p>
-            <h1 className="hero-title">Chat with your charts.</h1>
-            <p className="hero-sub">
-              Upload a chart, then keep asking — follow-up questions, new charts, the same
-              conversation. Powered by a vision-language model behind{' '}
-              <code className="chip">POST /api/ask</code>.
-            </p>
-          </header>
-        )}
-
         {HAS_AUTH && !token ? (
           <div className="card signin-card">
             <p className="signin-prompt">Sign in with Google to start.</p>
@@ -453,7 +449,10 @@ function App() {
               </>
             )}
 
-            {/* Transcript */}
+            {/* Transcript. When empty (no messages yet), an inert flex spacer takes its
+                place so the composer below still gets pushed to the bottom of the card
+                instead of sitting right under the chart-header/picker. */}
+            {messages.length === 0 && <div className="transcript-spacer" aria-hidden="true" />}
             {messages.length > 0 && (
               <ul className="transcript" aria-live="polite">
                 {messages.map((m, i) => (
