@@ -203,7 +203,10 @@ else
 fi
 
 BACKEND_ENV="USE_MOCK=${USE_MOCK},MOCK_DELAY_S=0,MOCK_REVEAL=0"
-BACKEND_ENV+=",VLM_URL=${VLM_URL},VLM_TIMEOUT=120,VLM_PROVIDER=${VLM_PROVIDER},VLM_AUTH=${VLM_AUTH}"
+# 200s (was 120s): a cold-start VLM (scale-to-zero GPU) can take ~90-100s just to load
+# weights before answering; 120s cut a real cold start off ~4s before it would have
+# succeeded (2026-07-14 incident) — see gunicorn.conf.py's timeout, kept >= this + margin.
+BACKEND_ENV+=",VLM_URL=${VLM_URL},VLM_TIMEOUT=200,VLM_PROVIDER=${VLM_PROVIDER},VLM_AUTH=${VLM_AUTH}"
 BACKEND_ENV+=",QWEN_MODEL_ID=Qwen/Qwen3-VL-8B-Instruct,QWEN_ADAPTER_PATH=,QWEN_QUANTIZATION=none"
 # Response behavior (app config, 2026-07): the backend picks a NAMED response mode and
 # sends it per-request; the VLM service validates + applies it (response_modes.py).
@@ -223,9 +226,11 @@ BACKEND_ENV+=",ANSWER_CACHE_ENABLED=1,ANSWER_CACHE_MAX=512,ANSWER_CACHE_TTL_S=36
 # Billing Budget + alert (set one up for your project; see docs/REVIEW_AND_ROADMAP.md
 # §3.7). 80/day: even a generous 60s/answer worst-case is ~80min GPU-active/day
 # (~nvidia-l4, 4vCPU/16GiB) ≈ $27/day only if fully saturated every day, which a
-# portfolio demo won't be — the rate limit (30/min) + scale-to-zero are the real cost
+# portfolio demo won't be — the rate limit (40/min) + scale-to-zero are the real cost
 # defenses. Raise further only alongside a real GCP Billing Budget alert.
-BACKEND_ENV+=",REDIS_URL=${REDIS_URL},RATELIMIT_ENABLED=1,RATELIMIT_PER_MINUTE=30,VLM_DAILY_BUDGET=80"
+# 40/min (was 30): headroom so a legitimate retry after a slow VLM cold start isn't
+# itself blocked by our own per-IP limiter stacking on top (2026-07-14).
+BACKEND_ENV+=",REDIS_URL=${REDIS_URL},RATELIMIT_ENABLED=1,RATELIMIT_PER_MINUTE=40,VLM_DAILY_BUDGET=100"
 BACKEND_ENV+=",GUARD_ENABLED=1,GUARD_TOXICITY_THRESHOLD=0.7,GUARD_INJECTION_THRESHOLD=0.8,GUARD_PII_THRESHOLD=0.6"
 BACKEND_ENV+=",GUARD_TOXICITY_MODEL=original,GUARD_INJECTION_MODEL=models/deberta-v3-base-prompt-injection-v2"
 # Guard latency fix (2026-07): skip Layer 3 (Llama Guard) only when a question is BOTH

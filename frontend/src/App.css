@@ -545,6 +545,10 @@
   overflow-y: auto;
 }
 
+.transcript-end {
+  height: 0;
+}
+
 .bubble {
   display: flex;
   max-width: 88%;
