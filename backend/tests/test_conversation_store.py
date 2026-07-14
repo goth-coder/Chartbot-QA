@@ -96,6 +96,59 @@ def test_get_returns_a_copy():
     assert len(cs.get(cid)["messages"]) == 2      # store not mutated by the caller
 
 
+def test_user_key_is_a_stable_hash_not_the_raw_sub():
+    k1 = cs.user_key("google-sub-123")
+    k2 = cs.user_key("google-sub-123")
+    assert k1 == k2                       # deterministic
+    assert k1 != "google-sub-123"         # never the raw id
+    assert "google-sub-123" not in k1
+
+
+def test_user_key_differs_per_user():
+    assert cs.user_key("sub-a") != cs.user_key("sub-b")
+
+
+def test_set_and_get_user_conversation_roundtrip():
+    ukey = cs.user_key("sub-a")
+    cid = cs.new_id()
+    cs.set_user_conversation(ukey, cid)
+    assert cs.get_user_conversation(ukey) == cid
+
+
+def test_get_user_conversation_unknown_user_returns_none():
+    assert cs.get_user_conversation(cs.user_key("never-seen")) is None
+
+
+def test_user_conversation_is_isolated_per_user():
+    ukey_a = cs.user_key("sub-a")
+    ukey_b = cs.user_key("sub-b")
+    cid_a = cs.new_id()
+    cs.set_user_conversation(ukey_a, cid_a)
+    assert cs.get_user_conversation(ukey_b) is None   # B never sees A's conversation
+    assert cs.get_user_conversation(ukey_a) == cid_a
+
+
+def test_set_user_conversation_overwrites_previous():
+    ukey = cs.user_key("sub-a")
+    cs.set_user_conversation(ukey, "old-id")
+    cs.set_user_conversation(ukey, "new-id")
+    assert cs.get_user_conversation(ukey) == "new-id"
+
+
+def test_user_conversation_disabled_is_a_noop(monkeypatch):
+    monkeypatch.setattr(cs, "_ENABLED", False)
+    ukey = cs.user_key("sub-a")
+    cs.set_user_conversation(ukey, "some-id")
+    assert cs.get_user_conversation(ukey) is None
+
+
+def test_reset_clears_user_index():
+    ukey = cs.user_key("sub-a")
+    cs.set_user_conversation(ukey, "some-id")
+    cs.reset()
+    assert cs.get_user_conversation(ukey) is None
+
+
 def test_ttl_expiry():
     cid = cs.new_id()
     cs.add_image(cid, b"img")

@@ -18,12 +18,19 @@ history-only read doesn't pull the PNGs.
 **TTL is refreshed on every write**, so an actively-used conversation never expires
 mid-chat; only abandoned ones age out (default 30 min).
 
+**Per-user restore (Phase 5.1):** a third namespace, ``user_key(sub) -> conversation_id``
+(see ``user_key``/``get_user_conversation``/``set_user_conversation``), lets a signed-in
+user's conversation survive sign-out/sign-in on a different device or after a reload —
+looked up by a SHA-256 hash of the Google ``sub`` claim, never the raw id. Same TTL/
+fail-open contract as everything else here.
+
 Config (.env): ``CONVERSATION_ENABLED``, ``CONVERSATION_TTL_S`` (idle expiry),
 ``CONVERSATION_MAX_TURNS`` (sliding-window cap on stored user/assistant pairs).
 """
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import time
 import uuid
@@ -44,17 +51,32 @@ _MAX_STORED_IMAGES = 20
 # history-only read never transfers the PNGs. Both share the same conversation_id and TTL.
 _RPREFIX = "conversation:"
 _IPREFIX = "conversation_images:"
+# user_key(sub) -> latest conversation_id, so a signed-in user's chat survives sign-out /
+# sign-in (Phase 5.1). Keyed by a HASH of the Google `sub`, never the raw id (see user_key).
+_UPREFIX = "conversation_user:"
 
 # In-memory fallback. id -> (stored_at_epoch, {"messages": [...], "created_ts": float}).
 _store: dict[str, tuple[float, dict]] = {}
 # id -> (stored_at_epoch, [image_bytes, ...])  (ordered, oldest -> newest)
 _images: dict[str, tuple[float, list[bytes]]] = {}
+# user_key -> (stored_at_epoch, conversation_id)
+_user_index: dict[str, tuple[float, str]] = {}
 _lock = Lock()
 
 
 def new_id() -> str:
     """A fresh conversation id (uuid4 hex)."""
     return uuid.uuid4().hex
+
+
+def user_key(sub: str) -> str:
+    """Hash a Google `sub` claim into the storage key for the user-conversation index.
+
+    The raw `sub` never becomes a Redis key or a log line — only this hash does. Callers
+    (app.py) must compute this once per request and pass the hash to
+    get_user_conversation/set_user_conversation, never the raw sub.
+    """
+    return hashlib.sha256(sub.encode("utf-8")).hexdigest()
 
 
 def _expired(stored_at: float) -> bool:
@@ -159,6 +181,56 @@ def append_turn(
         pass
 
 
+def get_user_conversation(ukey: str) -> str | None:
+    """Return the latest conversation_id for this user (see user_key), or None if the user
+    has no live conversation (never chatted, or it expired). Fail-open like the rest of
+    this module: any store error just means "nothing to restore"."""
+    if not _ENABLED or not ukey:
+        return None
+    try:
+        r = redis_client.client()
+        if r is not None:
+            raw = r.get(_UPREFIX + ukey)
+            return raw if raw else None
+        return _mem_get_user_conversation(ukey)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def set_user_conversation(ukey: str, conversation_id: str) -> None:
+    """Record/refresh which conversation is "current" for this user, so signing back in
+    restores it (see app.py's _prepare_ask). Same TTL as the conversation itself — an
+    abandoned chat's user-index entry expires alongside it."""
+    if not _ENABLED or not ukey or not conversation_id:
+        return
+    try:
+        r = redis_client.client()
+        if r is not None:
+            ex = _TTL if _TTL > 0 else None
+            r.set(_UPREFIX + ukey, conversation_id, ex=ex)
+            return
+        _mem_set_user_conversation(ukey, conversation_id)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _mem_get_user_conversation(ukey: str) -> str | None:
+    with _lock:
+        entry = _user_index.get(ukey)
+        if entry is None:
+            return None
+        stored_at, conversation_id = entry
+        if _expired(stored_at):
+            _user_index.pop(ukey, None)
+            return None
+        return conversation_id
+
+
+def _mem_set_user_conversation(ukey: str, conversation_id: str) -> None:
+    with _lock:
+        _user_index[ukey] = (time.time(), conversation_id)
+
+
 def _mem_get(conversation_id: str) -> dict | None:
     with _lock:
         entry = _store.get(conversation_id)
@@ -207,3 +279,4 @@ def reset() -> None:
     with _lock:
         _store.clear()
         _images.clear()
+        _user_index.clear()

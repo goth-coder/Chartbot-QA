@@ -18,6 +18,8 @@ Endpoints:
                             "status_code": <int>}. Powers the frontend's per-stage
                             progress UI; both endpoints share the same pipeline
                             generator (_ask_events) so they can never diverge.
+    GET  /api/conversation -> {"conversation_id": <str|null>, "messages": [...]} — the
+                            signed-in user's current conversation, if any (Phase 5.1).
 
 ``is_chart`` is a cheap Layer-1 heuristic (see chart_check) — a warning signal, not
 a hard block: when false, the UI can warn that results may be unreliable.
@@ -208,6 +210,29 @@ def guard_warm():
     return jsonify(status="ok")
 
 
+@app.get("/api/conversation")
+def get_conversation():
+    """Restore the signed-in user's current conversation, if any (Phase 5.1).
+
+    Called by the frontend right after sign-in (and on page load if already signed in)
+    so a user's chat survives sign-out/sign-in without ever showing another user's
+    history — the lookup is derived from the caller's own verified token, never a
+    client-supplied id. Fail-open: no live conversation (never chatted, or it expired)
+    is a normal 200 with conversation_id: null, not an error.
+    """
+    if (resp := _require_auth()) is not None:
+        return resp
+    user = _authenticated_user()
+    if user is None:  # AUTH_ENABLED=0 — nothing to restore
+        return jsonify(conversation_id=None, messages=[])
+    ukey = conversation_store.user_key(user["sub"])
+    conversation_id = conversation_store.get_user_conversation(ukey)
+    state = conversation_store.get(conversation_id) if conversation_id else None
+    if state is None:
+        return jsonify(conversation_id=None, messages=[])
+    return jsonify(conversation_id=conversation_id, messages=state.get("messages", []))
+
+
 def _guard_warm_bg() -> None:
     """Warm only the remote Layer-3 LLM (the ~90s cold-start surface). The in-process
     Layer-2 encoders are already warmed at boot (gunicorn.conf.py post_worker_init), so
@@ -275,7 +300,7 @@ def _prepare_ask():
     required and screened by the guard on every turn.
 
     Returns ``(prep, None)`` on success where ``prep`` is a dict
-    ``{question, image_bytes, rate_key, conversation_id, history, is_followup}``, or
+    ``{question, image_bytes, rate_key, conversation_id, history, is_followup, ukey}``, or
     ``(None, (body, status))`` with a ready-to-return Flask response on the first failure.
     """
     if (resp := _require_auth()) is not None:
@@ -285,6 +310,9 @@ def _prepare_ask():
     # bot can spoof via X-Forwarded-For), else client IP (AUTH_ENABLED=0).
     user = _authenticated_user()
     rate_key = user["sub"] if user else _client_ip()
+    # Per-user conversation restore (Phase 5.1): hashed once here, never the raw sub —
+    # see conversation_store.user_key(). None when signed out / AUTH_ENABLED=0.
+    ukey = conversation_store.user_key(user["sub"]) if user else None
 
     question = (request.form.get("question") or "").strip()
     image = request.files.get("image")
@@ -295,6 +323,13 @@ def _prepare_ask():
         return None, (jsonify(error="Please type a question."), 400)
     if _question_too_weak(question):
         return None, (jsonify(error="Please ask a more specific question."), 400)
+
+    # No id from the client (fresh browser session/reload) but this user has a live
+    # conversation on record: restore it transparently instead of starting a new one.
+    if not conversation_id and ukey:
+        restored_id = conversation_store.get_user_conversation(ukey)
+        if restored_id and conversation_store.get(restored_id) is not None:
+            conversation_id = restored_id
 
     # Resolve the conversation: a valid existing id makes this a follow-up whose images
     # come from the store; anything else starts a fresh conversation needing an image.
@@ -324,6 +359,7 @@ def _prepare_ask():
         "conversation_id": conversation_id,
         "history": history,
         "is_followup": is_followup,
+        "ukey": ukey,
     }
     return prep, None
 
@@ -343,7 +379,7 @@ def _ask_events(prep: dict):
     """The whole /api/ask pipeline, as a generator of progress events.
 
     ``prep`` is the dict from :func:`_prepare_ask`
-    (``question, image_bytes, rate_key, conversation_id, history, is_followup``).
+    (``question, image_bytes, rate_key, conversation_id, history, is_followup, ukey``).
 
     Yields ``{"stage": <name>, "status": "start"|"done", "elapsed_ms": <float|None>}``
     for each stage, ending with exactly one
@@ -373,6 +409,7 @@ def _ask_events(prep: dict):
     conversation_id = prep["conversation_id"]
     history = prep["history"]
     is_followup = prep["is_followup"]
+    ukey = prep["ukey"]
 
     if not ratelimit.allow(rate_key):
         metrics.count_rate_limited()
@@ -380,6 +417,11 @@ def _ask_events(prep: dict):
                "body": {"error": "Too many requests — please slow down and try again shortly."},
                "status_code": 429}
         return
+
+    # Per-user conversation restore (Phase 5.1): keep the user's "current conversation"
+    # pointer fresh on every turn they take, so signing back in later restores it.
+    if ukey:
+        conversation_store.set_user_conversation(ukey, conversation_id)
 
     # Sanitize a newly-uploaded image (re-encode from decoded pixels: rejects non-images,
     # strips any embedded/trailing payload). No new image on a plain follow-up.

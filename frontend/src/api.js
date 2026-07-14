@@ -126,6 +126,20 @@ export async function getHealth() {
   return res.json() // { status, mock }
 }
 
+// Restore the signed-in user's current conversation, if any (Phase 5.1) — called right
+// after sign-in and once on page load if already signed in, so a user's chat survives
+// sign-out/sign-in instead of starting empty every time. Never throws: a failed restore
+// just means the chat starts fresh, same fail-open spirit as the rest of this file.
+export async function getConversation(token) {
+  try {
+    const res = await fetch('/api/conversation', { headers: authHeaders(token) })
+    if (!res.ok) return null
+    return await res.json() // { conversation_id: <str|null>, messages: [...] }
+  } catch {
+    return null
+  }
+}
+
 // Fire-and-forget nudge for the remote VLM (RunPod dev pod / Cloud Run instance) so it
 // has a head start before the user's first real question. Never throws — a failed warm
 // ping just means the first /api/ask absorbs the full cold-start latency instead.

@@ -489,6 +489,100 @@ def test_unknown_conversation_id_requires_image(client, fresh_conversations):
     assert "image" in res.get_json()["error"].lower()
 
 
+# --- Per-user conversation restore (Phase 5.1) ---
+
+def _auth_as(monkeypatch, sub):
+    """Turn on auth and make `Authorization: Bearer <sub>` verify as that Google sub —
+    mirrors test_auth_required_allows_valid_token's monkeypatch pattern."""
+    import auth
+
+    monkeypatch.setattr(auth, "AUTH_ENABLED", True)
+    monkeypatch.setattr(
+        auth, "verify_google_token",
+        lambda token: {"email": f"{token}@example.com", "sub": token} if token else None,
+    )
+    return {"Authorization": f"Bearer {sub}"}
+
+
+def test_get_conversation_no_history_returns_null(client, fresh_conversations, monkeypatch):
+    headers = _auth_as(monkeypatch, "user-a")
+    res = client.get("/api/conversation", headers=headers)
+    assert res.status_code == 200
+    body = res.get_json()
+    assert body["conversation_id"] is None
+    assert body["messages"] == []
+
+
+def test_get_conversation_requires_auth(client, monkeypatch):
+    import auth
+
+    monkeypatch.setattr(auth, "AUTH_ENABLED", True)
+    res = client.get("/api/conversation")
+    assert res.status_code == 401
+
+
+def test_conversation_restored_for_same_user_after_a_turn(client, fresh_conversations, monkeypatch):
+    headers = _auth_as(monkeypatch, "user-a")
+    first = client.post(
+        "/api/ask",
+        data={"question": "What was revenue in 2024?", "image": (_png_bytes(), "chart.png")},
+        content_type="multipart/form-data",
+        headers=headers,
+    )
+    assert first.status_code == 200
+    cid = first.get_json()["conversation_id"]
+
+    res = client.get("/api/conversation", headers=headers)
+    assert res.status_code == 200
+    body = res.get_json()
+    assert body["conversation_id"] == cid
+    assert len(body["messages"]) == 2  # user + assistant
+
+
+def test_conversation_never_leaks_to_a_different_user(client, fresh_conversations, monkeypatch):
+    headers_a = _auth_as(monkeypatch, "user-a")
+    res = client.post(
+        "/api/ask",
+        data={"question": "What was revenue in 2024?", "image": (_png_bytes(), "chart.png")},
+        content_type="multipart/form-data",
+        headers=headers_a,
+    )
+    assert res.status_code == 200
+
+    # A DIFFERENT signed-in user must never see user-a's conversation.
+    headers_b = _auth_as(monkeypatch, "user-b")
+    res = client.get("/api/conversation", headers=headers_b)
+    assert res.status_code == 200
+    body = res.get_json()
+    assert body["conversation_id"] is None
+    assert body["messages"] == []
+
+
+def test_omitting_conversation_id_resumes_the_users_own_conversation(
+    client, fresh_conversations, monkeypatch
+):
+    # A follow-up that omits conversation_id (e.g. a fresh page load after sign-in) must
+    # transparently resume the SAME user's conversation rather than starting a new one.
+    headers = _auth_as(monkeypatch, "user-a")
+    first = client.post(
+        "/api/ask",
+        data={"question": "What was revenue in 2024?", "image": (_png_bytes(), "chart.png")},
+        content_type="multipart/form-data",
+        headers=headers,
+    )
+    cid = first.get_json()["conversation_id"]
+
+    followup = client.post(
+        "/api/ask",
+        data={"question": "And in 2023?"},  # no conversation_id, no image
+        content_type="multipart/form-data",
+        headers=headers,
+    )
+    assert followup.status_code == 200
+    assert followup.get_json()["conversation_id"] == cid
+    assert len(fresh_conversations.get(cid)["messages"]) == 4  # both turns recorded
+
+
 def test_second_image_added_and_both_fed_to_inference(client, fresh_conversations, monkeypatch):
     # A follow-up that uploads a SECOND image: it's added as image 2, and inference
     # receives BOTH images (numbered) so the user can ask about either.

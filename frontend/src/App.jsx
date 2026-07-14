@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
-import { askQuestionStream, getHealth, warmVlm, warmGuard, sendFeedback } from './api'
+import { askQuestionStream, getConversation, getHealth, warmVlm, warmGuard, sendFeedback } from './api'
 import './App.css'
 
 const MAX_BYTES = 10 * 1024 * 1024 // keep in sync with backend MAX_CONTENT_LENGTH
@@ -55,19 +55,43 @@ function App() {
 
   const started = messages.length > 0 || loading // conversation in progress?
 
+  // Fetch the signed-in user's own conversation from the backend and populate the
+  // transcript with it (Phase 5.1). Backend-authoritative and per-user (derived from the
+  // token server-side, see app.py's GET /api/conversation) — this is what lets each
+  // account keep its own history without ever inheriting another account's chat.
+  async function restoreConversation(idToken) {
+    const restored = await getConversation(idToken)
+    if (restored?.conversation_id && restored.messages?.length) {
+      setConversationId(restored.conversation_id)
+      setMessages(restored.messages)
+    }
+  }
+
   function handleSignedIn(idToken) {
+    // Defense in depth alongside handleSignOut's reset: a second account signing in on the
+    // same tab (Google's "choose an account" flow, or a silently-replaced expired token)
+    // must never inherit a still-in-memory chat from whoever was signed in before —
+    // restoreConversation() below then repopulates THIS account's own history, if any.
+    if (token && token !== idToken) resetConversation()
     setToken(idToken)
     sessionStorage.setItem(TOKEN_STORAGE_KEY, idToken)
     // Warm both scale-to-zero services right after sign-in (not before): the GPU VLM and
     // the Layer-3 guard, so their cold starts overlap the user's think-time.
     warmVlm(idToken)
     warmGuard(idToken)
+    restoreConversation(idToken)
   }
 
   function handleSignOut() {
     setToken(null)
     sessionStorage.removeItem(TOKEN_STORAGE_KEY)
     window.google?.accounts?.id?.disableAutoSelect()
+    // Clears the VISIBLE transcript only — the conversation itself is still persisted
+    // backend-side under this user's hashed id (conversation_store's TTL) and comes back
+    // via restoreConversation() next time they sign in. Without this reset, the next
+    // person to sign in on the same tab would see the previous user's chat before their
+    // own restore call resolves.
+    resetConversation()
   }
 
   // Probe the backend once so we can show a "mock mode" status pill. When there's no
@@ -83,6 +107,14 @@ function App() {
         }
       })
       .catch(() => {}) // health failure is non-fatal for the UI
+  }, [])
+
+  // If the page loads already signed in (token restored from sessionStorage, App.jsx:48-50
+  // — this path never calls handleSignedIn), restore this user's conversation the same way
+  // a fresh sign-in does. Runs once: token here is the token useState was initialized with.
+  useEffect(() => {
+    if (token) restoreConversation(token)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   // Render the Google "Sign in" button once its script has loaded and we're signed out.
@@ -127,10 +159,11 @@ function App() {
     }
   }, [])
 
-  // Keep the newest message in view as the transcript grows.
+  // Keep the newest message in view as the transcript grows — including mid-turn, as
+  // per-stage SSE progress rows (chart_gate/guard/vlm) or streamed answer text arrive.
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
-  }, [messages, loading])
+  }, [messages, loading, stages])
 
   function selectImage(file) {
     if (!file) return
@@ -455,6 +488,7 @@ function App() {
                     )}
                   </li>
                 ))}
+                <li ref={transcriptEndRef} className="transcript-end" aria-hidden="true" />
               </ul>
             )}
 
@@ -485,8 +519,6 @@ function App() {
                 {error}
               </p>
             )}
-
-            <div ref={transcriptEndRef} />
 
             {/* Pending mid-conversation attachment (a chart added for the NEXT question) */}
             {started && previewUrl && (
