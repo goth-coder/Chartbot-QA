@@ -15,8 +15,8 @@ matching ``env_config``:
     QWEN_MODEL_ID=Qwen/Qwen3-VL-8B-Instruct            # base VLM (downloaded from HF)
     QWEN_ADAPTER_PATH=checkpoints/qwen3vl-lora-final2   # LoRA dir; '' = base model
     QWEN_QUANTIZATION=none                              # none|8bit|4bit (bitsandbytes)
-    QWEN_MAX_NEW_TOKENS=64
-    QWEN_ANSWER_SUFFIX=" Please answer directly."
+    VLM_RESPONSE_MODE=reasoned                          # named response mode (response_modes.py)
+    VLM_MAX_NEW_TOKENS=                                 # optional token override ('' = mode default)
 
 Two serving modes:
   * **In-process** (``VLM_URL`` empty): load Qwen3-VL once and generate here. Needs a
@@ -38,7 +38,8 @@ import requests
 from PIL import Image
 
 import gcp_auth
-from env_config import env_float, env_int, env_str
+import response_modes
+from env_config import env_float, env_str
 
 # Repo root (backend/ -> repo). The backend process runs with cwd=backend/, so a
 # relative QWEN_ADAPTER_PATH is resolved against the repo root, not backend/.
@@ -85,38 +86,59 @@ def predict(images: list[bytes], question: str, history: list | None = None) -> 
     return _predict_local(images, question, history)
 
 
+def _response_mode_and_tokens() -> tuple[str, int | None]:
+    """The app-behavior knobs (which mode, optional token override) from backend env.
+    VLM_RESPONSE_MODE picks the named mode; VLM_MAX_NEW_TOKENS empty = use the mode's
+    default (resolved by response_modes on whichever side actually runs the model)."""
+    mode = env_str("VLM_RESPONSE_MODE").strip() or response_modes.DEFAULT_MODE
+    raw_tokens = env_str("VLM_MAX_NEW_TOKENS").strip()
+    return mode, (int(raw_tokens) if raw_tokens else None)
+
+
 def _predict_local(images: list[bytes], question: str, history: list | None = None) -> str:
-    """In-process inference: load Qwen3-VL once (cached) and generate here."""
+    """In-process inference: load Qwen3-VL once (cached) and generate here.
+
+    Applies the SAME response_modes.resolve() the remote VLM service uses, so in-process
+    (dev) and remote (prod) produce identical prompts — no behavior drift between paths.
+    """
     chat = _load_model()
     pil_images = [Image.open(io.BytesIO(b)).convert("RGB") for b in images]
 
+    mode, tokens = _response_mode_and_tokens()
+    system_prompt, max_new_tokens = response_modes.resolve(mode, tokens)
     answer = chat.chat(
         images=pil_images,
-        text=question.strip() + env_str("QWEN_ANSWER_SUFFIX"),
-        max_new_tokens=env_int("QWEN_MAX_NEW_TOKENS"),
+        text=question.strip(),
+        system_prompt=system_prompt,
+        max_new_tokens=max_new_tokens,
         history=history,
     )
-    # If the model echoes an "Answer:" prefix (CoT-style prompts), keep the tail.
+    # Keep only the terse final answer after the last "Answer:" (reasoned mode emits one).
     return answer.split("Answer:")[-1].strip()
 
 
 def _predict_remote(
     url: str, images: list[bytes], question: str, history: list | None = None
 ) -> str:
-    """Delegate to a remote VLM service: POST ``{images, question[, history]}`` -> ``{answer}``.
+    """Delegate to a remote VLM service: POST ``{images, question, response_mode,
+    max_new_tokens[, history]}`` -> ``{answer}``.
 
-    The service owns the model + generation config (suffix, max_new_tokens, "Answer:"
-    stripping), so the contract stays tiny and the backend carries no ML deps. This is
-    **not** fail-open: the VLM produces THE answer, so an unreachable/slow service
-    surfaces as an error (HTTP 5xx to the client) rather than a fabricated result. The
-    timeout is generous to survive a scale-to-zero cold start (mirrors GUARD_LLM_TIMEOUT).
+    Response BEHAVIOR travels with the request (response_mode + token budget) — the
+    service validates + applies it (see response_modes / vlm_service). The backend carries
+    no ML deps. This is **not** fail-open: the VLM produces THE answer, so an unreachable/
+    slow service surfaces as an error (HTTP 5xx to the client) rather than a fabricated
+    result. The timeout is generous to survive a scale-to-zero cold start.
 
     Auth (``VLM_AUTH``) is shared logic — see ``gcp_auth.auth_header``.
     """
+    mode, tokens = _response_mode_and_tokens()
     payload = {
         "images": [base64.b64encode(b).decode("ascii") for b in images],
         "question": question.strip(),
+        "response_mode": mode,
     }
+    if tokens is not None:
+        payload["max_new_tokens"] = tokens
     if history:
         payload["history"] = history
     headers = gcp_auth.auth_header(url, env_str("VLM_AUTH"))

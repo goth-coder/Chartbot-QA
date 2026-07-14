@@ -30,11 +30,12 @@ EXPOSE 8001
 # adapter by default; override to '' for a base-model-only image.
 # HF_HUB_OFFLINE=1: the base model is baked into vlm-base, so never phone home at boot —
 # this removes the last network dependency from a cold start and makes it deterministic.
+# Model-LOAD knobs only (infra config). Response behavior (prompt/tokens) is per-request
+# via response_mode — NOT baked here; see vlm_service/server.py + response_modes.py.
+# (gcloud_deploy_vlm.sh overrides QWEN_QUANTIZATION=none for the L4 which has VRAM to spare.)
 ENV QWEN_MODEL_ID=Qwen/Qwen3-VL-8B-Instruct \
     QWEN_ADAPTER_PATH=/app/modeling/checkpoints/qwen3vl-lora-final2 \
     QWEN_QUANTIZATION=4bit \
-    QWEN_MAX_NEW_TOKENS=64 \
-    QWEN_ANSWER_SUFFIX=" Please answer directly." \
     VLM_PORT=8001 \
     HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1

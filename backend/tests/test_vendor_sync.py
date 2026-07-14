@@ -1,19 +1,21 @@
-"""Drift check for the vendored Qwen3-VL wrapper.
+"""Drift check for the vendored modeling copies.
 
-`backend/qwen_vl_chat.py` is an intentional *vendored copy* of the source of truth
-`modeling/chartqa/models/qwen_vl_chat.py`, so the backend Docker image builds
-without the modeling tree or its training-only deps. A vendored copy is only safe
-if CI catches drift: this test strips the intentionally-divergent regions (marked
-in BOTH files with `# --- vendor-sync:ignore-start/end ---`) and asserts the
-remaining shared logic is byte-identical. Any edit to the shared wrapper in one
-file that is not mirrored in the other fails here.
+Two files are intentional *vendored copies* of a source of truth in the modeling tree,
+so the backend Docker image builds without the modeling tree or its training-only deps:
+  - `backend/qwen_vl_chat.py`   <- `modeling/chartqa/models/qwen_vl_chat.py`
+  - `backend/response_modes.py` <- `modeling/chartqa/response_modes.py`
 
-The intentional regions are: the vendoring/provenance header (differs by design)
-and the modeling copy's `__main__` demo (which pulls in the training-only
+A vendored copy is only safe if CI catches drift: this test strips the intentionally-
+divergent regions (marked in BOTH files with `# --- vendor-sync:ignore-start/end ---`)
+and asserts the remaining shared logic is byte-identical. Any edit to the shared logic
+in one file that is not mirrored in the other fails here.
+
+The intentional regions are the vendoring/provenance header (differs by design) and, for
+the qwen wrapper, the modeling copy's `__main__` demo (which pulls in the training-only
 `datasets` dep). Everything else must match.
 
-The test SKIPS cleanly when the modeling counterpart is absent, so it never breaks
-the backend image build (which ships without the modeling tree).
+Each pair SKIPS cleanly when its modeling counterpart is absent, so this never breaks the
+backend image build (which ships without the modeling tree).
 """
 
 import difflib
@@ -24,8 +26,17 @@ import pytest
 BACKEND_DIR = pathlib.Path(__file__).resolve().parents[1]
 REPO_ROOT = BACKEND_DIR.parent
 
-BACKEND_COPY = BACKEND_DIR / "qwen_vl_chat.py"
-MODELING_COPY = REPO_ROOT / "modeling" / "chartqa" / "models" / "qwen_vl_chat.py"
+# (backend vendored copy, modeling source of truth) pairs to keep in sync.
+_VENDORED_PAIRS = [
+    (
+        BACKEND_DIR / "qwen_vl_chat.py",
+        REPO_ROOT / "modeling" / "chartqa" / "models" / "qwen_vl_chat.py",
+    ),
+    (
+        BACKEND_DIR / "response_modes.py",
+        REPO_ROOT / "modeling" / "chartqa" / "response_modes.py",
+    ),
+]
 
 IGNORE_START = "# --- vendor-sync:ignore-start ---"
 IGNORE_END = "# --- vendor-sync:ignore-end ---"
@@ -62,29 +73,31 @@ def _shared_lines(path: pathlib.Path) -> list[str]:
     return kept
 
 
-def test_backend_copy_matches_modeling_source():
-    if not MODELING_COPY.exists():
+@pytest.mark.parametrize("backend_copy, modeling_copy", _VENDORED_PAIRS,
+                         ids=[p[0].name for p in _VENDORED_PAIRS])
+def test_backend_copy_matches_modeling_source(backend_copy, modeling_copy):
+    if not modeling_copy.exists():
         pytest.skip(
             "modeling counterpart absent (backend image builds without the modeling "
             "tree); drift check runs in dev/CI where modeling/ is present."
         )
 
-    backend_shared = _shared_lines(BACKEND_COPY)
-    modeling_shared = _shared_lines(MODELING_COPY)
+    backend_shared = _shared_lines(backend_copy)
+    modeling_shared = _shared_lines(modeling_copy)
 
     if backend_shared != modeling_shared:
         diff = "\n".join(
             difflib.unified_diff(
                 modeling_shared,
                 backend_shared,
-                fromfile=str(MODELING_COPY.relative_to(REPO_ROOT)),
-                tofile=str(BACKEND_COPY.relative_to(REPO_ROOT)),
+                fromfile=str(modeling_copy.relative_to(REPO_ROOT)),
+                tofile=str(backend_copy.relative_to(REPO_ROOT)),
                 lineterm="",
             )
         )
         pytest.fail(
-            "Vendored backend/qwen_vl_chat.py has drifted from its source of truth "
-            "modeling/chartqa/models/qwen_vl_chat.py. Mirror the shared-logic edit "
-            "into both files (or wrap a genuinely-intentional difference in "
+            f"Vendored {backend_copy.relative_to(REPO_ROOT)} has drifted from its source "
+            f"of truth {modeling_copy.relative_to(REPO_ROOT)}. Mirror the shared-logic "
+            "edit into both files (or wrap a genuinely-intentional difference in "
             f"vendor-sync:ignore markers).\n\n{diff}"
         )

@@ -8,17 +8,24 @@ gatekeeper — Qwen-8B does not fit the 6 GB 4050 (roadmap §B2), so this is whe
 (a cloud GPU, or a big local GPU).
 
 Contract (matches ``_predict_remote``):
-    POST /predict  {"image": "<base64>", "question": "..."}  -> {"answer": "..."}
+    POST /predict  {"images": ["<base64>", ...], "question": "...",
+                    "response_mode": "reasoned|direct"?, "max_new_tokens": <int>?,
+                    "history": [...]?}  -> {"answer": "..."}
     GET  /health   -> {"status": "ok", "model": "<id>", "adapter": "<path|null>"}
 
-The Qwen wrapper is imported from the installable modeling package
-(``pip install -e ./modeling``) — deliberately NOT re-vendored — so the loading /
-generation logic has a single source of truth (CLAUDE.md: no new vendored copies).
+Response BEHAVIOR (which prompt / how many tokens) is per-request, not per-deploy: the
+backend picks a NAMED ``response_mode`` + token budget and sends them; this service
+validates the mode against ``response_modes`` (allowlist + clamp) and applies the model's
+chat template. Do NOT re-introduce a baked-in ``QWEN_ANSWER_SUFFIX`` / ``QWEN_MAX_NEW_TOKENS``
+here — that drift (backend config the remote path ignored) is exactly what this replaced.
 
-Config via env (no in-code defaults for the model knobs; same keys as the backend's
-in-process path so dev↔prod is one URL flip):
-    QWEN_MODEL_ID, QWEN_ADAPTER_PATH ('' = base model), QWEN_QUANTIZATION (none|8bit|4bit),
-    QWEN_MAX_NEW_TOKENS, QWEN_ANSWER_SUFFIX
+The Qwen wrapper + response-mode registry are imported from the installable modeling
+package (``pip install -e ./modeling``) — deliberately NOT re-vendored here — so the
+loading/generation logic has a single source of truth (CLAUDE.md: no new vendored copies).
+
+Config via env (no in-code defaults for the model-LOAD knobs — those ARE infra config;
+behavior knobs are per-request, above):
+    QWEN_MODEL_ID, QWEN_ADAPTER_PATH ('' = base model), QWEN_QUANTIZATION (none|8bit|4bit)
     VLM_HOST (default 0.0.0.0), VLM_PORT (default 8001)   # operational, defaults allowed
 """
 from __future__ import annotations
@@ -31,6 +38,7 @@ import os
 from flask import Flask, jsonify, request
 from PIL import Image
 
+from chartqa import response_modes
 from chartqa.models.qwen_vl_chat import QwenVLChat
 
 logging.basicConfig(level=logging.INFO)
@@ -46,11 +54,10 @@ def _require(name: str) -> str:
 
 
 # --- Warm the model ONCE at import (boot), never in the request path. ---
+# Only model-LOAD knobs live in env here; response behavior (prompt/tokens) is per-request.
 _MODEL_ID = _require("QWEN_MODEL_ID")
 _ADAPTER = _require("QWEN_ADAPTER_PATH").strip() or None
 _QUANT = _require("QWEN_QUANTIZATION")
-_SUFFIX = _require("QWEN_ANSWER_SUFFIX")
-_MAX_NEW_TOKENS = int(_require("QWEN_MAX_NEW_TOKENS"))
 
 log.info("Loading %s (adapter=%s, quantization=%s) ...", _MODEL_ID, _ADAPTER, _QUANT)
 _CHAT = QwenVLChat(model_name=_MODEL_ID, adapter_path=_ADAPTER, quantization=_QUANT)
@@ -80,14 +87,22 @@ def predict():
     if not images_b64 or not question:
         return jsonify(error="'images' (base64 list) and 'question' are required."), 400
 
+    # Behavior is per-request: validate the requested mode against the allowlist (unknown
+    # -> default, never errors) and clamp the token budget — never trust a raw request
+    # value. The mode becomes a system prompt, NOT a suffix on the user's question text.
+    system_prompt, max_new_tokens = response_modes.resolve(
+        data.get("response_mode"), data.get("max_new_tokens")
+    )
+
     pil_images = [
         Image.open(io.BytesIO(base64.b64decode(b))).convert("RGB") for b in images_b64
     ]
     raw = _CHAT.chat(
-        images=pil_images, text=question + _SUFFIX, max_new_tokens=_MAX_NEW_TOKENS,
-        history=history,
+        images=pil_images, text=question, system_prompt=system_prompt,
+        max_new_tokens=max_new_tokens, history=history,
     )
-    # Same post-processing as the in-process path so both modes return identical answers.
+    # Same post-processing as the in-process path so both modes return identical answers:
+    # keep only the terse final answer after the last "Answer:" the reasoning may emit.
     answer = raw.split("Answer:")[-1].strip()
     return jsonify(answer=answer)
 
