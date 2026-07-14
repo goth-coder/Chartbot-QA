@@ -149,6 +149,27 @@ def test_reset_clears_user_index():
     assert cs.get_user_conversation(ukey) is None
 
 
+def test_clear_user_conversation_unlinks_the_user():
+    ukey = cs.user_key("sub-a")
+    cs.set_user_conversation(ukey, "some-id")
+    cs.clear_user_conversation(ukey)
+    assert cs.get_user_conversation(ukey) is None
+
+
+def test_clear_user_conversation_does_not_delete_the_conversation_itself():
+    cid = cs.new_id()
+    cs.add_image(cid, b"img")
+    ukey = cs.user_key("sub-a")
+    cs.set_user_conversation(ukey, cid)
+    cs.clear_user_conversation(ukey)
+    # The conversation is still reachable by id — only the user's pointer to it is gone.
+    assert cs.get(cid) is not None
+
+
+def test_clear_user_conversation_unknown_user_is_a_noop():
+    cs.clear_user_conversation(cs.user_key("never-seen"))  # must not raise
+
+
 def test_ttl_expiry():
     cid = cs.new_id()
     cs.add_image(cid, b"img")

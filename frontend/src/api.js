@@ -140,6 +140,14 @@ export async function getConversation(token) {
   }
 }
 
+// Un-link the signed-in user from their current conversation (the "New session" button)
+// so GET /api/conversation does NOT bring it back on a future sign-in/reload. Fire-and-
+// forget: never throws — a failed unlink just means the old chat might resurface later,
+// never a broken "New session" click.
+export function clearConversation(token) {
+  fetch('/api/conversation', { method: 'DELETE', headers: authHeaders(token) }).catch(() => {})
+}
+
 // Fire-and-forget nudge for the remote VLM (RunPod dev pod / Cloud Run instance) so it
 // has a head start before the user's first real question. Never throws — a failed warm
 // ping just means the first /api/ask absorbs the full cold-start latency instead.

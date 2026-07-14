@@ -214,6 +214,24 @@ def set_user_conversation(ukey: str, conversation_id: str) -> None:
         pass
 
 
+def clear_user_conversation(ukey: str) -> None:
+    """Un-link this user from whatever conversation they were last on (e.g. "New session"
+    in the UI) — so a future sign-in does NOT restore the abandoned chat. The conversation
+    itself (and its images) is left alone; it just ages out via its own TTL once nothing
+    else points at it. Fail-open: an error here just means the old chat might resurface on
+    next sign-in, never a broken request."""
+    if not _ENABLED or not ukey:
+        return
+    try:
+        r = redis_client.client()
+        if r is not None:
+            r.delete(_UPREFIX + ukey)
+            return
+        _mem_clear_user_conversation(ukey)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _mem_get_user_conversation(ukey: str) -> str | None:
     with _lock:
         entry = _user_index.get(ukey)
@@ -229,6 +247,11 @@ def _mem_get_user_conversation(ukey: str) -> str | None:
 def _mem_set_user_conversation(ukey: str, conversation_id: str) -> None:
     with _lock:
         _user_index[ukey] = (time.time(), conversation_id)
+
+
+def _mem_clear_user_conversation(ukey: str) -> None:
+    with _lock:
+        _user_index.pop(ukey, None)
 
 
 def _mem_get(conversation_id: str) -> dict | None:

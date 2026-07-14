@@ -605,6 +605,40 @@ def test_omitting_conversation_id_resumes_the_users_own_conversation(
     assert len(fresh_conversations.get(cid)["messages"]) == 4  # both turns recorded
 
 
+def test_delete_conversation_prevents_future_restore(client, fresh_conversations, monkeypatch):
+    # "New session": after DELETE, a follow-up with no conversation_id must NOT resume the
+    # old conversation (it should require a fresh image, same as a brand-new turn 1).
+    headers = _auth_as(monkeypatch, "user-a")
+    client.post(
+        "/api/ask",
+        data={"question": "What was revenue in 2024?", "image": (_png_bytes(), "chart.png")},
+        content_type="multipart/form-data",
+        headers=headers,
+    )
+
+    del_res = client.delete("/api/conversation", headers=headers)
+    assert del_res.status_code == 200
+
+    restore = client.get("/api/conversation", headers=headers)
+    assert restore.get_json()["conversation_id"] is None
+
+    followup = client.post(
+        "/api/ask",
+        data={"question": "And in 2023?"},  # no conversation_id, no image
+        content_type="multipart/form-data",
+        headers=headers,
+    )
+    assert followup.status_code == 400  # requires an image, exactly like a fresh turn 1
+
+
+def test_delete_conversation_requires_auth(client, monkeypatch):
+    import auth
+
+    monkeypatch.setattr(auth, "AUTH_ENABLED", True)
+    res = client.delete("/api/conversation")
+    assert res.status_code == 401
+
+
 def test_second_image_added_and_both_fed_to_inference(client, fresh_conversations, monkeypatch):
     # A follow-up that uploads a SECOND image: it's added as image 2, and inference
     # receives BOTH images (numbered) so the user can ask about either.

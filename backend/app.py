@@ -20,6 +20,8 @@ Endpoints:
                             generator (_ask_events) so they can never diverge.
     GET  /api/conversation -> {"conversation_id": <str|null>, "messages": [...]} — the
                             signed-in user's current conversation, if any (Phase 5.1).
+    DELETE /api/conversation -> {"status": "ok"} — un-link the user from their current
+                            conversation (e.g. "New session") so it isn't restored later.
 
 ``is_chart`` is a cheap Layer-1 heuristic (see chart_check) — a warning signal, not
 a hard block: when false, the UI can warn that results may be unreliable.
@@ -244,6 +246,23 @@ def get_conversation():
         if idx and 1 <= idx <= len(images):
             m["image_data_uri"] = "data:image/png;base64," + base64.b64encode(images[idx - 1]).decode("ascii")
     return jsonify(conversation_id=conversation_id, messages=messages)
+
+
+@app.delete("/api/conversation")
+def clear_conversation():
+    """Un-link the signed-in user from their current conversation (the "New session"
+    button) so it does NOT come back on a future sign-in/reload via GET /api/conversation.
+
+    The conversation itself is left alone (still reachable by conversation_id, e.g. an
+    in-flight request that already captured it) — it just ages out on its own TTL once
+    nothing points at it anymore. Idempotent; fail-open like the rest of this module.
+    """
+    if (resp := _require_auth()) is not None:
+        return resp
+    user = _authenticated_user()
+    if user is not None:
+        conversation_store.clear_user_conversation(conversation_store.user_key(user["sub"]))
+    return jsonify(status="ok")
 
 
 def _guard_warm_bg() -> None:

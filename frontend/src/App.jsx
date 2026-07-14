@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
-import { askQuestionStream, getConversation, getHealth, warmVlm, warmGuard, sendFeedback } from './api'
+import { askQuestionStream, clearConversation, getConversation, getHealth, warmVlm, warmGuard, sendFeedback } from './api'
 import './App.css'
 
 const MAX_BYTES = 10 * 1024 * 1024 // keep in sync with backend MAX_CONTENT_LENGTH
@@ -250,6 +250,15 @@ function App() {
     setLoading(false)
   }
 
+  // The "New session" button: clears the visible chat AND tells the backend to forget
+  // this user's current conversation, so it does NOT come back via restoreConversation()
+  // on a future sign-in/reload. Distinct from resetConversation() alone, which is also
+  // used by sign-out/sign-in (where the conversation SHOULD still be restorable later).
+  function startNewSession() {
+    resetConversation()
+    if (token) clearConversation(token)
+  }
+
   async function onSubmit(e) {
     e.preventDefault()
     setError('')
@@ -373,7 +382,7 @@ function App() {
             the same conversation.</p>
         )}
         {started && (
-          <button type="button" className="signout" onClick={resetConversation}>
+          <button type="button" className="signout" onClick={startNewSession}>
             New session
           </button>
         )}
