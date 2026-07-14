@@ -1,10 +1,13 @@
-from torch.utils.data import Dataset
+# Import `datasets` (which pulls in pyarrow) BEFORE torch: on Windows, torch
+# 2.6.0+cu124 loaded first corrupts the DLL-load order so a later
+# `import pyarrow.dataset` access-violation-crashes the process (exit 139).
+# This module is the first in both the eval and analysis import chains to touch
+# either library, so ordering it here fixes both entrypoints (mirrors the lazy
+# `datasets` import in chartqa/models/qwen_vl_chat.py).
 from datasets import load_dataset
+from torch.utils.data import Dataset
 
-# HuggingFaceM4/ChartQA ships train/val/test with columns:
-#   image, query (question), label (answer, stored as a single-element list),
-#   human_or_machine.
-DATASET_NAME = "HuggingFaceM4/ChartQA"
+from chartqa.constants import DATASET_NAME
 
 
 class ChartQADataset(Dataset):

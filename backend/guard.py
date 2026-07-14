@@ -17,6 +17,16 @@ Design constraints:
 
 Contract: ``guard(question) -> GuardResult``. Fail-closed for safety categories
 (toxic / prompt_injection); PII blocks only on high-risk entity types.
+
+**Layer 3 is now CONDITIONAL, not unconditional (2026-07 latency fix).** Llama Guard
+(guard_llm.llm_classify) does two jobs: a semantic safety net for content that scored
+low-but-not-zero on Layer 2, and the only check for off-topic questions. Calling it on
+every single allowed request (even an obviously clean "what was the peak value?") was
+the dominant latency cost of the whole guard stack. It's now skipped ONLY when a
+question is BOTH confidently clean on every Layer-2 signal (below the LOW thresholds
+below, not just under the block thresholds) AND confidently on-topic per
+``topic_check.py`` — see ``guard()`` for the exact cascade. Anything either check is
+unsure about still goes to Layer 3, unchanged.
 """
 
 from __future__ import annotations
@@ -24,7 +34,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 
-from env_config import env_bool, env_float, env_str
+from env_config import env_bool, env_float, env_str, resolve_model_path
 
 # --- Tunables (required in .env; no in-code defaults) -----------------------
 TOXICITY_THRESHOLD = env_float("GUARD_TOXICITY_THRESHOLD")
@@ -32,8 +42,13 @@ INJECTION_THRESHOLD = env_float("GUARD_INJECTION_THRESHOLD")
 PII_SCORE_THRESHOLD = env_float("GUARD_PII_THRESHOLD")
 GUARD_ENABLED = env_bool("GUARD_ENABLED")
 # Model identifiers (swap without code changes, e.g. a smaller/quantized variant).
-TOXICITY_MODEL = env_str("GUARD_TOXICITY_MODEL")
-INJECTION_MODEL = env_str("GUARD_INJECTION_MODEL")
+TOXICITY_MODEL = env_str("GUARD_TOXICITY_MODEL")  # detoxify (torch.hub / GitHub, not HF Xet)
+INJECTION_MODEL = resolve_model_path(env_str("GUARD_INJECTION_MODEL"))
+# "Confidently clean" — well BELOW the block thresholds above. A score between this and
+# the block threshold is the ambiguous band Llama Guard is actually good at judging; only
+# a score below BOTH low thresholds (plus no PII hits) is confident enough to skip it.
+TOXICITY_LOW = env_float("GUARD_TOXICITY_LOW")
+INJECTION_LOW = env_float("GUARD_INJECTION_LOW")
 
 # Block only on high-risk identifiers; ignore PERSON/LOCATION/ORG/DATE to avoid
 # false positives on ordinary chart questions ("What was John's revenue?").
@@ -139,10 +154,15 @@ def pii_hits(text: str) -> list[str] | None:
 
 # --- Orchestrator -----------------------------------------------------------
 def guard(question: str) -> GuardResult:
-    """Screen the question through the Layer-2 classifiers, then the Layer-3 LLM.
+    """Screen the question through the Layer-2 classifiers, then — CONDITIONALLY — the
+    Layer-3 LLM.
 
     Returns ``allowed=True`` when nothing fires OR when a detector is unavailable
-    (fail-open). Order: toxicity -> prompt injection -> PII -> Layer-3 LLM.
+    (fail-open). Order: toxicity -> prompt injection -> PII (any of these BLOCKS
+    outright, unchanged) -> confidence check -> Layer-3 LLM, but the LLM call is now
+    SKIPPED when the question is both confidently clean (every Layer-2 score below its
+    LOW threshold) and confidently on-topic (topic_check.py). Anything either check is
+    unsure about still reaches Layer 3, same as before this optimization.
     """
     if not GUARD_ENABLED:
         return GuardResult(True)
@@ -165,7 +185,29 @@ def guard(question: str) -> GuardResult:
             "Please remove personal data from your question (e.g. " + ", ".join(hits) + ").",
         )
 
-    # --- Layer 3: LLM input boundary filter (Llama Guard) — last, gated, fail-open ---
+    # Confidently clean on Layer 2 = every score present AND below its LOW threshold (a
+    # detector that's unavailable, i.e. None, does NOT count as "confidently clean" — a
+    # missing signal is exactly the kind of uncertainty that should still reach Layer 3).
+    layer2_confident_clean = (
+        tox is not None and tox < TOXICITY_LOW
+        and inj is not None and inj < INJECTION_LOW
+        and hits is not None  # ran and found nothing (hits == [] falls through above)
+    )
+
+    if layer2_confident_clean:
+        from topic_check import is_confidently_on_topic
+        if is_confidently_on_topic(question):
+            # Both cheap checks agree: clean AND on-topic — skip the LLM round-trip.
+            try:
+                import metrics
+                metrics.count_guard_layer3_skipped()
+            except Exception:  # noqa: BLE001 — metrics are themselves fail-open
+                pass
+            return GuardResult(True)
+
+    # --- Layer 3: LLM input boundary filter (Llama Guard) — gated, fail-open ---
+    # Reached whenever Layer 2 is anything less than confidently clean, OR the topic
+    # check didn't confirm on-topic (including when the classifier is unavailable).
     # Lazy import avoids a circular import (guard_llm imports GuardResult from here).
     try:
         from guard_llm import llm_classify
@@ -182,11 +224,19 @@ def warmup() -> None:
     """Pre-load every guard model off the request path (call at boot, in a thread).
 
     Fail-open: if a model's deps aren't installed the loader just returns None and this
-    does nothing heavy. Loads Layer-2 encoders, then warms the Layer-3 LLM.
+    does nothing heavy. Loads Layer-2 encoders + the topic-check classifier, then warms
+    the Layer-3 LLM (still warmed unconditionally — it's the fallback for anything the
+    cheap checks are unsure about, so it must be ready regardless of how often it ends
+    up actually being called).
     """
     _load_toxicity()
     _load_injection()
     _load_pii()
+    try:
+        import topic_check
+        topic_check.warmup()
+    except Exception:  # noqa: BLE001
+        pass
     try:
         import guard_llm
         guard_llm.warmup()
@@ -196,8 +246,14 @@ def warmup() -> None:
 
 def is_available() -> dict[str, bool]:
     """Which detectors actually have their model loaded (for /api/health, debugging)."""
+    try:
+        import topic_check
+        topic_available = topic_check.is_available()
+    except Exception:  # noqa: BLE001
+        topic_available = False
     return {
         "toxicity": _load_toxicity() is not None,
         "prompt_injection": _load_injection() is not None,
         "pii": _load_pii() is not None,
+        "topic_check": topic_available,
     }

@@ -9,24 +9,37 @@ stays free of heavy ML deps. All knobs come from ``.env`` (no in-code defaults),
 matching ``env_config``:
 
     USE_MOCK=0
+    VLM_URL=                                            # empty = in-process; URL = remote service
+    VLM_TIMEOUT=120                                     # remote call timeout (survives cold start)
+    VLM_AUTH=none                                       # none | gcp_id_token (private Cloud Run GPU)
     QWEN_MODEL_ID=Qwen/Qwen3-VL-8B-Instruct            # base VLM (downloaded from HF)
     QWEN_ADAPTER_PATH=checkpoints/qwen3vl-lora-final2   # LoRA dir; '' = base model
-    QWEN_MAX_NEW_TOKENS=64
-    QWEN_ANSWER_SUFFIX=" Please answer directly."
+    QWEN_QUANTIZATION=none                              # none|8bit|4bit (bitsandbytes)
+    VLM_RESPONSE_MODE=reasoned                          # named response mode (response_modes.py)
+    VLM_MAX_NEW_TOKENS=                                 # optional token override ('' = mode default)
 
-Requires a CUDA GPU and the deps in requirements.txt (torch, transformers, peft,
-accelerate, pillow). The model is loaded once per process and cached.
+Two serving modes:
+  * **In-process** (``VLM_URL`` empty): load Qwen3-VL once and generate here. Needs a
+    CUDA GPU + the heavy deps (torch, transformers, peft, accelerate). Good for dev on a
+    big GPU. Qwen-8B does NOT fit the 6 GB 4050 (roadmap §B2).
+  * **Remote** (``VLM_URL`` set): POST ``{image, question}`` to a separate VLM HTTP
+    service (the production scale-to-zero GPU path, see ``vlm_service/``). The backend
+    then needs neither torch nor the model — only ``requests``.
 """
 
 from __future__ import annotations
 
+import base64
 import io
 from functools import lru_cache
 from pathlib import Path
 
+import requests
 from PIL import Image
 
-from env_config import env_int, env_str
+import gcp_auth
+import response_modes
+from env_config import env_float, env_str
 
 # Repo root (backend/ -> repo). The backend process runs with cwd=backend/, so a
 # relative QWEN_ADAPTER_PATH is resolved against the repo root, not backend/.
@@ -49,18 +62,86 @@ def _load_model():
 
     model_id = env_str("QWEN_MODEL_ID")
     adapter_path = _resolve_adapter_path(env_str("QWEN_ADAPTER_PATH"))
-    return QwenVLChat(model_name=model_id, adapter_path=adapter_path)
-
-
-def predict(image_bytes: bytes, question: str) -> str:
-    """Return a short answer (1-10 words) for a chart image + question."""
-    chat = _load_model()
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-
-    answer = chat.chat(
-        image=image,
-        text=question.strip() + env_str("QWEN_ANSWER_SUFFIX"),
-        max_new_tokens=env_int("QWEN_MAX_NEW_TOKENS"),
+    # Opt-in bitsandbytes quantization ('none' = full precision). With 8bit/4bit
+    # the wrapper keeps the LoRA adapter attached instead of merging it (a
+    # quantized base cannot be merged) and fails loudly if bitsandbytes is missing.
+    return QwenVLChat(
+        model_name=model_id,
+        adapter_path=adapter_path,
+        quantization=env_str("QWEN_QUANTIZATION"),
     )
-    # If the model echoes an "Answer:" prefix (CoT-style prompts), keep the tail.
+
+
+def predict(images: list[bytes], question: str, history: list | None = None) -> str:
+    """Return a short answer (1-10 words) for chart image(s) + question.
+
+    Routes to the remote VLM service when ``VLM_URL`` is set, else runs in-process.
+    The frontend/API contract is identical either way. ``images`` is the ordered list of
+    the conversation's charts (oldest -> newest); ``history`` (prior ``{"role", "text"}``
+    turns) continues a multi-turn conversation.
+    """
+    url = env_str("VLM_URL").strip()
+    if url:
+        return _predict_remote(url, images, question, history)
+    return _predict_local(images, question, history)
+
+
+def _response_mode_and_tokens() -> tuple[str, int | None]:
+    """The app-behavior knobs (which mode, optional token override) from backend env.
+    VLM_RESPONSE_MODE picks the named mode; VLM_MAX_NEW_TOKENS empty = use the mode's
+    default (resolved by response_modes on whichever side actually runs the model)."""
+    mode = env_str("VLM_RESPONSE_MODE").strip() or response_modes.DEFAULT_MODE
+    raw_tokens = env_str("VLM_MAX_NEW_TOKENS").strip()
+    return mode, (int(raw_tokens) if raw_tokens else None)
+
+
+def _predict_local(images: list[bytes], question: str, history: list | None = None) -> str:
+    """In-process inference: load Qwen3-VL once (cached) and generate here.
+
+    Applies the SAME response_modes.resolve() the remote VLM service uses, so in-process
+    (dev) and remote (prod) produce identical prompts — no behavior drift between paths.
+    """
+    chat = _load_model()
+    pil_images = [Image.open(io.BytesIO(b)).convert("RGB") for b in images]
+
+    mode, tokens = _response_mode_and_tokens()
+    system_prompt, max_new_tokens = response_modes.resolve(mode, tokens)
+    answer = chat.chat(
+        images=pil_images,
+        text=question.strip(),
+        system_prompt=system_prompt,
+        max_new_tokens=max_new_tokens,
+        history=history,
+    )
+    # Keep only the terse final answer after the last "Answer:" (reasoned mode emits one).
     return answer.split("Answer:")[-1].strip()
+
+
+def _predict_remote(
+    url: str, images: list[bytes], question: str, history: list | None = None
+) -> str:
+    """Delegate to a remote VLM service: POST ``{images, question, response_mode,
+    max_new_tokens[, history]}`` -> ``{answer}``.
+
+    Response BEHAVIOR travels with the request (response_mode + token budget) — the
+    service validates + applies it (see response_modes / vlm_service). The backend carries
+    no ML deps. This is **not** fail-open: the VLM produces THE answer, so an unreachable/
+    slow service surfaces as an error (HTTP 5xx to the client) rather than a fabricated
+    result. The timeout is generous to survive a scale-to-zero cold start.
+
+    Auth (``VLM_AUTH``) is shared logic — see ``gcp_auth.auth_header``.
+    """
+    mode, tokens = _response_mode_and_tokens()
+    payload = {
+        "images": [base64.b64encode(b).decode("ascii") for b in images],
+        "question": question.strip(),
+        "response_mode": mode,
+    }
+    if tokens is not None:
+        payload["max_new_tokens"] = tokens
+    if history:
+        payload["history"] = history
+    headers = gcp_auth.auth_header(url, env_str("VLM_AUTH"))
+    resp = requests.post(url, json=payload, headers=headers, timeout=env_float("VLM_TIMEOUT"))
+    resp.raise_for_status()
+    return resp.json()["answer"]

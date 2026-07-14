@@ -1,0 +1,16 @@
+# Builds the THIN backend/Dockerfile (FROM the prebuilt chartqa-backend-base) with
+# backend/ as context (so backend/.dockerignore governs it — excludes .venv, tests, and
+# the models/ dir already baked into the base). Invoked by scripts/gcloud_deploy_app.sh
+# via `gcloud builds submit backend --config backend/cloudbuild.yaml`.
+# Fast: no apt/pip/model download — just pulls backend-base (cached) + copies the app source.
+# _BASE_IMAGE is the Artifact Registry path of chartqa-backend-base:latest.
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --build-arg=BACKEND_BASE_IMAGE=${_BASE_IMAGE}
+      - -t
+      - ${_IMAGE}
+      - .
+images: ["${_IMAGE}"]
+timeout: "1200s"

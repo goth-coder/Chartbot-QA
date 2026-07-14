@@ -1,0 +1,63 @@
+# backend BASE image — the expensive, rarely-rebuilt half of the backend image.
+# Mirrors the vlm-base / vlm-service split (see vlm_service/Dockerfile.base): Cloud Build
+# has no persistent layer cache, so baking the heavy deps + the ML models into a rarely-
+# rebuilt base means a normal code deploy (the thin backend/Dockerfile, FROM this) rebuilds
+# in ~2-3 min instead of re-installing torch/transformers and re-fetching ~1.4 GB of models
+# every time.
+#
+# REBUILD THIS ONLY WHEN one of these changes (all rare):
+#   - the python base image tag,
+#   - a pip dependency (requirements.txt / requirements-guard.txt),
+#   - the set of ML models under backend/models/.
+# A normal code/config deploy does NOT need this — it reruns scripts/gcloud_deploy_app.sh,
+# which builds the thin `FROM backend-base` image. Build with:
+#   scripts/gcloud_build_backend_base.sh   (context = repo root; needs backend/models/)
+FROM python:3.12-slim
+
+# Tesseract OCR engine — the system binary pytesseract shells out to (so the "has data
+# values" gate runs without a host install). On PATH here (backend sets TESSERACT_CMD="").
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        tesseract-ocr \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# CPU build of torch — the backend runs CLIP on CPU; the GPU is for the vLLM guard.
+# Installed first so transformers/detoxify don't pull the much larger CUDA wheel.
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+
+# Layer-2 guard models pull in transformers/presidio/detoxify and (via `-r
+# requirements.txt`) the app + CLIP deps. `pip uninstall -y hf_xet` + HF_HUB_DISABLE_XET
+# below are DEFENSE-IN-DEPTH against HF's Xet transfer protocol, which fails on Cloud
+# Build's network (403 / stalls) — the real fix is COPYing the models in (below), but
+# keeping Xet off means any stray HF Hub call falls back to plain HTTPS, not broken Xet.
+COPY backend/requirements.txt backend/requirements-guard.txt ./
+RUN pip install --no-cache-dir -r requirements-guard.txt \
+    && pip uninstall -y hf_xet hf-xet 2>/dev/null || true \
+    && python -m spacy download en_core_web_lg
+
+# Run as a non-root user (security hardening, §3.7). Create it BEFORE the model steps and
+# point every ML cache at a dir it owns, then switch to it — so weights are cached (and
+# found at runtime) under the runtime user, not root's unreadable ~/.cache. HF_HOME covers
+# transformers/CLIP/deberta; TORCH_HOME covers detoxify's torch.hub download.
+ENV HF_HOME=/opt/ml-cache/hf \
+    TORCH_HOME=/opt/ml-cache/torch \
+    XDG_CACHE_HOME=/opt/ml-cache/xdg \
+    HF_HUB_DISABLE_XET=1
+RUN useradd --create-home --uid 10001 appuser \
+    && mkdir -p /opt/ml-cache && chown -R appuser:appuser /opt/ml-cache /app
+USER appuser
+
+# Pre-cache detoxify's toxicity model (unitary/toxic-bert). This one is fetched from a
+# GitHub release via torch.hub — NOT the HF Hub — so it's unaffected by the HF Xet problem
+# and can still download at build time. (Presidio/PII uses the spaCy model installed above.)
+RUN python -c "from detoxify import Detoxify; Detoxify('original')"
+
+# The three HF-hosted models — CLIP (chart gate), deberta-v3 (prompt-injection), and
+# all-MiniLM-L6-v2 (topic-check) — are COPY'd from the build context, NOT downloaded. HF
+# now serves their weights only via its Xet CDN (xet-bridge / cdn.hf.co), whose endpoints
+# fail on Cloud Build's network (403 / stall). They're downloaded on a dev machine (where
+# Xet works) into backend/models/ and baked in here; chart_check.py / guard.py /
+# topic_check.py load each from /app/models/... (env_config.resolve_model_path resolves the
+# relative model paths against the backend dir). See backend/models/README.md to repopulate.
+COPY --chown=appuser:appuser backend/models /app/models

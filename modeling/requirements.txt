@@ -1,0 +1,22 @@
+# Core deep-learning stack (directly imported by the package)
+torch
+torchvision         # required by the Qwen3-VL processor (video sub-processor)
+transformers        # must be recent enough for Qwen3-VL (Qwen3VLForConditionalGeneration)
+peft                # LoRA fine-tuning
+datasets            # ChartQA dataset loading
+matplotlib          # training-loss plots
+tqdm                # progress bars
+
+# Runtime deps required by the above but not imported directly
+accelerate          # transformers device_map="auto"
+pillow              # datasets decodes the image column into PIL images
+sentencepiece       # BLIP-2 / Flan-T5 tokenizer
+
+# Experiment tracking (chartqa.tracking): pure-Python, no torch. Fail-open — if
+# absent, evaluate.py / finetune_lora.py run unchanged (tracking becomes a no-op).
+# The local file store (./mlruns) is the v1-local backend; browse it with `mlflow ui`.
+mlflow>=2.14,<3
+
+# Optional: 4-/8-bit quantized loading (evaluate.py --quantization 4bit|8bit).
+# Opt-in — uncomment to enable; the loader fails loudly if requested but missing.
+# bitsandbytes>=0.43

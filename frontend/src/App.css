@@ -56,6 +56,22 @@
   background-color: var(--mute);
 }
 
+.signout {
+  font-family: inherit;
+  font-size: 13px;
+  color: var(--mute);
+  background: none;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-pill);
+  padding: var(--s-xs) var(--s-md);
+  cursor: pointer;
+}
+
+.signout:hover {
+  color: var(--ink);
+  border-color: var(--ink);
+}
+
 /* ── Layout ──────────────────────────────────────────────────────── */
 .container {
   max-width: 720px;
@@ -112,6 +128,19 @@
   background-color: var(--canvas);
   border: 1px solid var(--hairline);
   border-radius: var(--r-md);
+}
+
+/* ── Sign-in gate (Phase 3.7 required Google login) ─────────────────*/
+.signin-card {
+  align-items: center;
+  padding: var(--s-4xl) var(--s-2xl);
+  text-align: center;
+}
+
+.signin-prompt {
+  margin: 0;
+  font-size: 16px;
+  color: var(--body);
 }
 
 /* ── Image picker / dropzone ─────────────────────────────────────── */
@@ -282,17 +311,55 @@
   gap: var(--s-sm);
 }
 
-.processing {
+/* Per-stage progress (Phase: streamed /api/ask/stream) — each row appears as its
+   stage starts, gets a checkmark + elapsed time when done. Replaces the old single
+   "Processing model…" line with real per-stage traceability. */
+.stage-list {
   display: flex;
-  align-items: center;
-  gap: var(--s-sm);
+  flex-direction: column;
+  gap: var(--s-xs);
   margin: 0;
   padding: var(--s-md) var(--s-lg);
-  font-size: 14px;
-  color: var(--body);
+  list-style: none;
   background-color: var(--canvas-soft);
   border: 1px solid var(--hairline);
   border-radius: var(--r-sm);
+}
+
+.stage-row {
+  display: flex;
+  align-items: center;
+  gap: var(--s-sm);
+  font-size: 14px;
+  color: var(--mute);
+}
+
+.stage-row.stage-done {
+  color: var(--body);
+}
+
+.stage-check {
+  flex-shrink: 0;
+  width: 16px;
+  text-align: center;
+  color: #6ee7a8;
+  font-weight: 700;
+}
+
+.stage-spinner {
+  width: 14px;
+  height: 14px;
+}
+
+.stage-label {
+  flex: 1 1 auto;
+}
+
+.stage-time {
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--mute);
 }
 
 .spinner {
@@ -399,6 +466,322 @@
   color: var(--mute);
 }
 
+/* ── Chat card (Phase 5 conversational v2) ───────────────────────── */
+.chat-card {
+  gap: var(--s-lg);
+}
+
+/* Pinned chart header — the image the whole conversation is about */
+.chart-header {
+  display: flex;
+  align-items: center;
+  gap: var(--s-lg);
+  padding: var(--s-md);
+  background-color: var(--canvas-soft);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+}
+
+.chart-thumb {
+  width: 96px;
+  height: 72px;
+  object-fit: cover;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--hairline);
+  flex-shrink: 0;
+}
+
+.chart-meta {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-xxs);
+  min-width: 0;
+}
+
+.chart-remove {
+  margin-left: auto;
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  font-size: 14px;
+  color: var(--mute);
+  background: transparent;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-pill);
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.chart-remove:hover {
+  color: var(--ink);
+  border-color: var(--primary);
+}
+
+.chart-name {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chart-hint {
+  font-size: 12px;
+  color: var(--mute);
+}
+
+/* Transcript — the list of chat bubbles */
+.transcript {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-md);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: 460px;
+  overflow-y: auto;
+}
+
+.transcript-end {
+  height: 0;
+}
+
+.bubble {
+  display: flex;
+  max-width: 88%;
+}
+
+.bubble-user {
+  align-self: flex-end;
+}
+
+.bubble-assistant {
+  align-self: flex-start;
+}
+
+.bubble-body {
+  padding: var(--s-md) var(--s-lg);
+  border-radius: var(--r-md);
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+.bubble-user .bubble-body {
+  color: var(--on-primary);
+  background-color: var(--primary);
+  border-bottom-right-radius: var(--r-xs);
+}
+
+/* User turn with an attached chart (ChatGPT-style: image above the question) */
+.bubble-user-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--s-sm);
+}
+
+.bubble-figure {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--s-xxs);
+}
+
+.bubble-image {
+  max-width: 100%;
+  max-height: 240px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--hairline);
+}
+
+.bubble-image-cap {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--mute);
+}
+
+/* Mid-conversation attachment chip (a chart queued for the next question) */
+.attach-chip {
+  display: flex;
+  align-items: center;
+  gap: var(--s-sm);
+  padding: var(--s-xs) var(--s-sm);
+  background-color: var(--canvas-soft);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  align-self: flex-start;
+}
+
+.attach-thumb {
+  width: 40px;
+  height: 30px;
+  object-fit: cover;
+  border-radius: var(--r-xs);
+  border: 1px solid var(--hairline);
+}
+
+.attach-name {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--body);
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attach-remove {
+  margin-left: var(--s-xs);
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  font-size: 12px;
+  color: var(--mute);
+  background: transparent;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-pill);
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.attach-remove:hover {
+  color: var(--ink);
+  border-color: var(--primary);
+}
+
+/* Attach button in the composer */
+.attach-btn {
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  width: 44px;
+  color: var(--mute);
+  background-color: var(--canvas-soft);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.attach-btn:hover:not(:disabled) {
+  color: var(--ink);
+  border-color: var(--primary);
+}
+
+.attach-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.bubble-assistant .bubble-body {
+  color: var(--ink);
+  background-color: var(--canvas-soft);
+  border: 1px solid var(--hairline);
+  border-bottom-left-radius: var(--r-xs);
+}
+
+.bubble-assistant .bubble-body.bubble-blocked {
+  color: #ffd479;
+  background: rgba(255, 212, 121, 0.08);
+  border-color: rgba(255, 212, 121, 0.35);
+}
+
+/* Markdown answer body — tighten default element margins inside a bubble */
+.markdown > :first-child {
+  margin-top: 0;
+}
+.markdown > :last-child {
+  margin-bottom: 0;
+}
+.markdown p {
+  margin: 0 0 var(--s-sm);
+}
+.markdown ul,
+.markdown ol {
+  margin: 0 0 var(--s-sm);
+  padding-left: var(--s-xl);
+}
+.markdown code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  padding: 1px 4px;
+  background: rgba(255, 255, 255, 0.07);
+  border-radius: var(--r-xs);
+}
+.markdown table {
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.markdown th,
+.markdown td {
+  border: 1px solid var(--hairline);
+  padding: 4px 8px;
+}
+
+/* Answer footer — meta + 👍/👎 feedback */
+.bubble-foot {
+  display: flex;
+  align-items: center;
+  gap: var(--s-md);
+  margin-top: var(--s-sm);
+}
+
+.bubble-meta {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--mute);
+}
+
+.feedback {
+  display: inline-flex;
+  gap: var(--s-xs);
+  margin-left: auto;
+}
+
+.vote {
+  padding: 2px 6px;
+  font-size: 14px;
+  line-height: 1;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--r-xs);
+  cursor: pointer;
+  opacity: 0.55;
+  transition: opacity 0.15s, border-color 0.15s, background-color 0.15s;
+}
+
+.vote:hover {
+  opacity: 1;
+}
+
+.vote.vote-on {
+  opacity: 1;
+  background-color: rgba(0, 217, 146, 0.12);
+  border-color: var(--primary);
+}
+
+/* Composer — the follow-up input row */
+.composer {
+  display: flex;
+  gap: var(--s-md);
+  align-items: stretch;
+}
+
+.composer .text-input {
+  flex: 1 1 auto;
+}
+
+.composer .submit {
+  align-self: stretch;
+  display: inline-flex;
+  align-items: center;
+}
+
 /* ── Responsive ──────────────────────────────────────────────────── */
 @media (max-width: 768px) {
   .container {
@@ -410,5 +793,8 @@
   }
   .nav-bar {
     padding: var(--s-md) var(--s-xl);
+  }
+  .bubble {
+    max-width: 100%;
   }
 }

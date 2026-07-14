@@ -20,15 +20,19 @@ Fails open everywhere: if nothing can decide, we assume it IS a chart
 from __future__ import annotations
 
 import io
+import logging
+import threading
 from collections import Counter
 
-from env_config import env_float, env_int, env_str
+from env_config import env_float, env_int, env_str, resolve_model_path
+
+log = logging.getLogger("chart_check")
 
 # --- CLIP zero-shot stage ------------------------------------------------
 
 # Both configurable via env so the model and cutoff can be tuned without code
 # changes. Defaults per the project doc.
-_CLIP_MODEL = env_str("CHART_CLIP_MODEL")
+_CLIP_MODEL = resolve_model_path(env_str("CHART_CLIP_MODEL"))
 _CLIP_THRESHOLD = env_float("CHART_CLIP_THRESHOLD")
 
 # Path to the Tesseract engine for non-PATH installs (Windows, pinned container
@@ -71,25 +75,54 @@ _MIN_DATA_DIGITS = env_int("CHART_MIN_DATA_DIGITS")  # min numeric chars for a r
 
 # Lazy singleton: None = not tried yet, False = unavailable, else (model, proc, torch).
 _clip = None
+# Guards first-use init: gunicorn runs this app with multiple threads (see
+# gunicorn.conf.py), so without a lock, concurrent first requests would each race into
+# _load_clip() and load/hold their own CLIP copy (~600MB each) at once.
+_clip_lock = threading.Lock()
 
 
 def _load_clip():
-    """Load CLIP once. Returns (model, processor, torch) or None if unavailable."""
+    """Load CLIP once. Returns (model, processor, torch) or None if unavailable.
+
+    Logs on both outcomes (2026-07 fix): a silent failure here means the gate quietly
+    drops from CLIP zero-shot to the much cruder pixel heuristic with no signal anywhere
+    that it happened — a real observability gap that made a live false "not a chart"
+    impossible to diagnose from logs alone.
+    """
     global _clip
     if _clip is not None:
         return _clip or None
-    try:
-        import torch
-        from transformers import CLIPModel, CLIPProcessor
+    with _clip_lock:
+        if _clip is not None:  # another thread finished loading while we waited
+            return _clip or None
+        try:
+            import torch
+            from transformers import CLIPModel, CLIPProcessor
 
-        model = CLIPModel.from_pretrained(_CLIP_MODEL)
-        model.eval()
-        processor = CLIPProcessor.from_pretrained(_CLIP_MODEL)
-        _clip = (model, processor, torch)
-        return _clip
-    except Exception:
-        _clip = False  # don't retry on every request
-        return None
+            model = CLIPModel.from_pretrained(_CLIP_MODEL)
+            model.eval()
+            processor = CLIPProcessor.from_pretrained(_CLIP_MODEL)
+            _clip = (model, processor, torch)
+            log.info("Chart gate: CLIP model %s loaded.", _CLIP_MODEL)
+            return _clip
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "Chart gate: CLIP model %s failed to load (%s) — falling back to the pixel "
+                "heuristic for every request until restart.", _CLIP_MODEL, exc
+            )
+            _clip = False  # don't retry on every request
+            return None
+
+
+def warmup() -> None:
+    """Pre-load the CLIP model off the request path (call at boot, in a thread).
+
+    Without this, CLIP loads lazily on the first real /api/ask request — racing
+    guard.warmup()'s background thread for CPU/memory while multiple gunicorn threads
+    could all hit the lazy singleton at once. Mirrors guard.warmup()'s pattern; wired
+    into the same boot-time warmup call in gunicorn.conf.py's post_worker_init.
+    """
+    _load_clip()
 
 
 def _clip_chart_prob(image_bytes: bytes):
@@ -193,7 +226,17 @@ def looks_like_chart(image_bytes: bytes) -> tuple[bool, float]:
     """
     prob = _clip_chart_prob(image_bytes)
     if prob is not None:
-        # Chart iff CLIP says chart AND the image shows real numeric data.
-        is_chart = prob >= _CLIP_THRESHOLD and _has_data_values(image_bytes)
+        # Chart iff CLIP is confident it's a chart. The OCR "has numeric data" veto was
+        # dropped (2026-07-13): it produced false "not a chart" verdicts on real charts
+        # whose values are labels rather than OCR-legible digits — e.g. a horizontal bar
+        # chart of country names, or small/anti-aliased axis ticks Tesseract misses. CLIP
+        # recognizes chart *structure* reliably; the digit check was too brittle to gate
+        # on. (_has_data_values is kept for optional confidence boosting / future use.)
+        is_chart = prob >= _CLIP_THRESHOLD
+        if not is_chart:
+            # Log every REJECTED verdict — this is exactly the case that's hard to debug
+            # from a live report ("it said not-a-chart") without knowing the real score.
+            log.info("Chart gate: CLIP P(chart)=%.3f < threshold %.2f -> rejected.",
+                      prob, _CLIP_THRESHOLD)
         return is_chart, round(prob, 3)
     return _heuristic_chart(image_bytes)
