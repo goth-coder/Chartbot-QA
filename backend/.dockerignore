@@ -6,6 +6,10 @@
 .ruff_cache/
 tests/
 *.md
+# The ML models are baked into the chartqa-backend-base image (via backend/Dockerfile.base,
+# repo-root context). The THIN backend/Dockerfile (this context = backend/) must NOT re-ship
+# them — they're already in the base, and re-copying 1.4 GB would bloat every code deploy.
+models/
 # Secrets never belong in the image — config arrives via env_file/compose.
 .env
 .env.*

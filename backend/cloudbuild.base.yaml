@@ -1,0 +1,15 @@
+# Builds backend/Dockerfile.base (the chartqa-backend-base image) with the REPO ROOT as
+# context (it needs backend/requirements*.txt + backend/models/). Invoked by
+# scripts/gcloud_build_backend_base.sh via
+# `gcloud builds submit --config backend/cloudbuild.base.yaml .`. Run RARELY — only on a
+# pip-dep bump or a change to the backend/models/ set (see Dockerfile.base's header).
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-f", "backend/Dockerfile.base", "-t", "${_IMAGE}", "."]
+images: ["${_IMAGE}"]
+# The context includes ~1.4 GB of models to upload, plus torch/transformers installs and a
+# ~2 GB image to push — past Cloud Build's 10-minute default. Give it a generous margin.
+timeout: "2400s"
+options:
+  machineType: "E2_HIGHCPU_8"
+  diskSizeGb: 50

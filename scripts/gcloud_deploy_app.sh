@@ -88,6 +88,7 @@ if [[ -z "$PROJECT" ]]; then
 fi
 
 BACKEND_IMAGE="${REGION}-docker.pkg.dev/${PROJECT}/${REPO}/backend:latest"
+BACKEND_BASE_IMAGE="${REGION}-docker.pkg.dev/${PROJECT}/${REPO}/backend-base:latest"
 FRONTEND_IMAGE="${REGION}-docker.pkg.dev/${PROJECT}/${REPO}/frontend:latest"
 echo "[deploy-app] project=$PROJECT region=$REGION"
 
@@ -103,20 +104,22 @@ if ! gcloud artifacts repositories describe "$REPO" --location "$REGION" \
     --description "Chart-Visual-QA images"
 fi
 
-echo "[deploy-app] building + pushing backend image..."
-# Uses backend/cloudbuild.yaml so the build can inject HF_TOKEN via Cloud Build's native
-# Secret Manager integration (availableSecrets/secretEnv) — stabilizes the Dockerfile's
-# multiple HuggingFace model-precache steps (CLIP, detoxify, deberta-injection, the
-# topic-check embedding model): anonymous HF Hub requests are rate-limited and have
-# repeatedly stalled builds past the 60min Cloud Build timeout in this project.
-# IMPORTANT: the secret "HF_TOKEN" must already exist in Secret Manager (console or
-# `gcloud secrets create HF_TOKEN --data-file=-`) with the Cloud Build service account
-# (PROJECT_NUMBER@cloudbuild.gserviceaccount.com) granted roles/secretmanager.secretAccessor
-# on it — NEVER pass the token via --substitutions/--build-arg on this command line, which
-# Cloud Build logs in plaintext (tried once, reverted for exactly that reason).
+# The thin backend image is FROM chartqa-backend-base (heavy deps + baked ML models) —
+# that must exist first. Fail fast with a clear pointer instead of erroring deep in a
+# `docker pull` on a missing base (mirrors gcloud_deploy_vlm.sh's base guard).
+if ! gcloud artifacts docker images describe "$BACKEND_BASE_IMAGE" --project "$PROJECT" >/dev/null 2>&1; then
+  echo "[deploy-app] ERROR: base image not found: $BACKEND_BASE_IMAGE" >&2
+  echo "[deploy-app]   Build it once first (rare, a few min):" >&2
+  echo "[deploy-app]     ./scripts/gcloud_build_backend_base.sh --project ${PROJECT} --region ${REGION}" >&2
+  echo "[deploy-app]   (populate backend/models/ first — see backend/models/README.md)." >&2
+  exit 1
+fi
+
+echo "[deploy-app] building + pushing thin backend image (FROM backend-base — no model"
+echo "  download, just the app source, so this is ~2-3 min)..."
 gcloud builds submit backend --project "$PROJECT" \
   --config backend/cloudbuild.yaml \
-  --substitutions="_IMAGE=${BACKEND_IMAGE}"
+  --substitutions="_IMAGE=${BACKEND_IMAGE},_BASE_IMAGE=${BACKEND_BASE_IMAGE}"
 
 SA_ARGS=()   # extra `gcloud run deploy` args for the backend (service account, when real)
 NEEDS_SA=0
@@ -224,14 +227,14 @@ BACKEND_ENV+=",ANSWER_CACHE_ENABLED=1,ANSWER_CACHE_MAX=512,ANSWER_CACHE_TTL_S=36
 # defenses. Raise further only alongside a real GCP Billing Budget alert.
 BACKEND_ENV+=",REDIS_URL=${REDIS_URL},RATELIMIT_ENABLED=1,RATELIMIT_PER_MINUTE=30,VLM_DAILY_BUDGET=80"
 BACKEND_ENV+=",GUARD_ENABLED=1,GUARD_TOXICITY_THRESHOLD=0.7,GUARD_INJECTION_THRESHOLD=0.8,GUARD_PII_THRESHOLD=0.6"
-BACKEND_ENV+=",GUARD_TOXICITY_MODEL=original,GUARD_INJECTION_MODEL=protectai/deberta-v3-base-prompt-injection-v2"
+BACKEND_ENV+=",GUARD_TOXICITY_MODEL=original,GUARD_INJECTION_MODEL=models/deberta-v3-base-prompt-injection-v2"
 # Guard latency fix (2026-07): skip Layer 3 (Llama Guard) only when a question is BOTH
 # confidently clean (below these LOW thresholds, well under the block thresholds above)
 # AND confidently on-topic per the cheap zero-shot classifier below. See guard.py.
 BACKEND_ENV+=",GUARD_TOXICITY_LOW=0.15,GUARD_INJECTION_LOW=0.2"
 BACKEND_ENV+=",TOPIC_CHECK_ENABLED=1,TOPIC_CHECK_MODEL=models/all-MiniLM-L6-v2,TOPIC_CHECK_THRESHOLD=0.44"
 BACKEND_ENV+=",GUARD_LLM_ENABLED=${GUARD_LLM_ENABLED},GUARD_LLM_URL=${GUARD_URL},GUARD_LLM_AUTH=${GUARD_LLM_AUTH},GUARD_LLM_MODEL=llama-guard3:1b,GUARD_LLM_TIMEOUT=60"
-BACKEND_ENV+=",CHART_CLIP_MODEL=openai/clip-vit-base-patch32,CHART_CLIP_THRESHOLD=0.5,CHART_MIN_DATA_DIGITS=2,CHART_BLOCK_THRESHOLD=0.4"
+BACKEND_ENV+=",CHART_CLIP_MODEL=models/clip-vit-base-patch32,CHART_CLIP_THRESHOLD=0.5,CHART_MIN_DATA_DIGITS=2,CHART_BLOCK_THRESHOLD=0.4"
 BACKEND_ENV+=",CHART_SAMPLE_SIZE=128,CHART_MIN_BACKGROUND_RATIO=0.18,CHART_MAX_DISTINCT_COLORS=48,TESSERACT_CMD="
 # Required Google login (3.7). AUTH_ENABLED=0 (default) = no login wall, matches local
 # dev. GOOGLE_CLIENT_ID is public (it's the OAuth audience, not a secret) — safe as a

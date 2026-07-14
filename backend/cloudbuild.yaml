@@ -1,27 +1,16 @@
-# Builds backend/Dockerfile with HF_TOKEN injected via Cloud Build's native Secret
-# Manager integration (availableSecrets + secretEnv) — NOT --substitutions/--build-arg,
-# which are logged in PLAINTEXT in the build's own history (tried first, reverted for
-# exactly that reason). secretEnv values are masked in logs and never persisted in the
-# build record. The secret "HF_TOKEN" must already exist in Secret Manager with the
-# Cloud Build service account (PROJECT_NUMBER@cloudbuild.gserviceaccount.com) granted
-# roles/secretmanager.secretAccessor on it.
-#
-# HF_TOKEN speeds up / stabilizes the multiple HuggingFace model-precache RUN steps in
-# the Dockerfile (CLIP, detoxify, deberta-injection, the topic-check embedding model):
-# anonymous HF Hub requests are rate-limited and have repeatedly stalled builds in this
-# project past Cloud Build's 60min timeout.
-#
-# Context is backend/ itself (see scripts/gcloud_deploy_app.sh: `gcloud builds submit
-# backend --config backend/cloudbuild.yaml ...`).
+# Builds the THIN backend/Dockerfile (FROM the prebuilt chartqa-backend-base) with
+# backend/ as context (so backend/.dockerignore governs it — excludes .venv, tests, and
+# the models/ dir already baked into the base). Invoked by scripts/gcloud_deploy_app.sh
+# via `gcloud builds submit backend --config backend/cloudbuild.yaml`.
+# Fast: no apt/pip/model download — just pulls backend-base (cached) + copies the app source.
+# _BASE_IMAGE is the Artifact Registry path of chartqa-backend-base:latest.
 steps:
   - name: gcr.io/cloud-builders/docker
-    secretEnv: ["HF_TOKEN"]
-    entrypoint: bash
     args:
-      - -c
-      - docker build --build-arg=HF_TOKEN="$$HF_TOKEN" -t ${_IMAGE} .
+      - build
+      - --build-arg=BACKEND_BASE_IMAGE=${_BASE_IMAGE}
+      - -t
+      - ${_IMAGE}
+      - .
 images: ["${_IMAGE}"]
-availableSecrets:
-  secretManager:
-    - versionName: projects/${PROJECT_ID}/secrets/HF_TOKEN/versions/latest
-      env: HF_TOKEN
+timeout: "1200s"

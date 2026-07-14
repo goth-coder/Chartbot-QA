@@ -23,7 +23,7 @@ import io
 import logging
 from collections import Counter
 
-from env_config import env_float, env_int, env_str
+from env_config import env_float, env_int, env_str, resolve_model_path
 
 log = logging.getLogger("chart_check")
 
@@ -31,7 +31,7 @@ log = logging.getLogger("chart_check")
 
 # Both configurable via env so the model and cutoff can be tuned without code
 # changes. Defaults per the project doc.
-_CLIP_MODEL = env_str("CHART_CLIP_MODEL")
+_CLIP_MODEL = resolve_model_path(env_str("CHART_CLIP_MODEL"))
 _CLIP_THRESHOLD = env_float("CHART_CLIP_THRESHOLD")
 
 # Path to the Tesseract engine for non-PATH installs (Windows, pinned container

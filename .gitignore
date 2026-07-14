@@ -151,6 +151,12 @@ activemq-data/
 # Too large for GitHub (>100 MB/file); host on HF Hub or Git LFS instead.
 checkpoints/
 
+# Backend HF models (CLIP, deberta-injection, all-MiniLM topic-check) — ~1.4 GB, baked
+# into the chartqa-backend-base image (Artifact Registry), NOT committed to git. HF now
+# serves these only via its Xet CDN, which fails on Cloud Build; they're downloaded on a
+# dev machine and COPY'd into the base image. See backend/models/README.md to repopulate.
+backend/models/
+
 # Environments
 .env
 .envrc

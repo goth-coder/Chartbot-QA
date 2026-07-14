@@ -34,7 +34,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 
-from env_config import env_bool, env_float, env_str
+from env_config import env_bool, env_float, env_str, resolve_model_path
 
 # --- Tunables (required in .env; no in-code defaults) -----------------------
 TOXICITY_THRESHOLD = env_float("GUARD_TOXICITY_THRESHOLD")
@@ -42,8 +42,8 @@ INJECTION_THRESHOLD = env_float("GUARD_INJECTION_THRESHOLD")
 PII_SCORE_THRESHOLD = env_float("GUARD_PII_THRESHOLD")
 GUARD_ENABLED = env_bool("GUARD_ENABLED")
 # Model identifiers (swap without code changes, e.g. a smaller/quantized variant).
-TOXICITY_MODEL = env_str("GUARD_TOXICITY_MODEL")
-INJECTION_MODEL = env_str("GUARD_INJECTION_MODEL")
+TOXICITY_MODEL = env_str("GUARD_TOXICITY_MODEL")  # detoxify (torch.hub / GitHub, not HF Xet)
+INJECTION_MODEL = resolve_model_path(env_str("GUARD_INJECTION_MODEL"))
 # "Confidently clean" — well BELOW the block thresholds above. A score between this and
 # the block threshold is the ambiguous band Llama Guard is actually good at judging; only
 # a score below BOTH low thresholds (plus no PII hits) is confident enough to skip it.
