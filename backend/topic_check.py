@@ -34,12 +34,38 @@ open toward the safety net, never toward silently skipping it).
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 
 from env_config import env_bool, env_float, env_str
 
 TOPIC_CHECK_ENABLED = env_bool("TOPIC_CHECK_ENABLED")
-TOPIC_CHECK_MODEL = env_str("TOPIC_CHECK_MODEL")
 TOPIC_CHECK_THRESHOLD = env_float("TOPIC_CHECK_THRESHOLD")
+
+
+def _resolve_model(raw: str) -> str:
+    """Resolve TOPIC_CHECK_MODEL to either a local model dir or a HF repo id.
+
+    A value that names a directory on disk — checked BOTH as given and relative to this
+    module's dir (so ``models/all-MiniLM-L6-v2`` works regardless of cwd: dev runs from
+    backend/, the container from /app) — is used as a local path. Otherwise it's treated
+    as a HF repo id (e.g. ``sentence-transformers/all-MiniLM-L6-v2``) and passed through.
+
+    Why a local path is the default: all-MiniLM-L6-v2's weights are served only via HF's
+    Xet CDN, whose endpoints fail on Cloud Build's network (403 SignatureError), so the
+    model can't be downloaded during the image build. It's committed to the repo (Git LFS)
+    and loaded from disk instead — see backend/models/ and the Dockerfile COPY.
+    """
+    raw = raw.strip()
+    if not raw:
+        return raw
+    here = Path(__file__).resolve().parent
+    for candidate in (Path(raw), here / raw):
+        if candidate.is_dir():
+            return str(candidate)
+    return raw  # not a local dir -> a HF repo id
+
+
+TOPIC_CHECK_MODEL = _resolve_model(env_str("TOPIC_CHECK_MODEL"))
 
 # ~80 real questions from HuggingFaceM4/ChartQA's train split (random sample, seed=42),
 # hardcoded so no dataset download happens at runtime — this is a fixed reference set,

@@ -17,20 +17,55 @@ RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/wh
 
 # Layer-2 guard models pull in transformers/presidio/detoxify and (via `-r
 # requirements.txt`) the app + CLIP deps. Cached as its own layer.
+#
+# `pip uninstall -y hf_xet` is the DETERMINISTIC fix for the CLIP/model-bake stalls that
+# plagued this project's builds (2026-07). Root cause: recent huggingface_hub versions
+# declare hf-xet as a platform-conditional dependency (auto-installed on x86_64), which
+# makes model downloads use the Xet transfer protocol (xet-bridge / cdn.hf.co) instead of
+# plain HTTPS. Those Xet endpoints fail/hang on Cloud Build's network (a 403 SignatureError
+# or an indefinite stall — confirmed in build logs), while the ordinary HF Hub HTTPS
+# endpoints work fine. The intended off-switch, HF_HUB_DISABLE_XET=1, did NOT take effect
+# in the build for reasons we couldn't pin down, so we remove the package outright:
+# huggingface_hub's is_xet_available() is `HF_HUB_DISABLE_XET off AND is_package_available("hf_xet")`,
+# so with the package gone, downloads ALWAYS use the classic HTTP path — no flag to honor,
+# no version-behavior to depend on. (Xet works fine on normal networks; this is purely a
+# Cloud Build network incompatibility.)
 COPY requirements.txt requirements-guard.txt ./
 RUN pip install --no-cache-dir -r requirements-guard.txt \
+    && pip uninstall -y hf_xet hf-xet 2>/dev/null || true \
     && python -m spacy download en_core_web_lg
 
 # Run as a non-root user (security hardening, §3.7). Create it BEFORE the model-precache
 # steps and point every ML cache at a dir it owns, then switch to it — so the weights are
 # cached (and found at runtime) under the runtime user, not root's unreadable ~/.cache.
 # HF_HOME covers transformers/CLIP/deberta; TORCH_HOME covers detoxify's torch.hub download.
+#
+# HF_HUB_DISABLE_XET=1 is the REAL fix for the CLIP-download stalls that plagued this
+# project's builds (2026-07): a transitive dep bump pulled in `hf-xet`, which makes
+# huggingface_hub use the Xet transfer protocol (cas-*.xethub.hf.co) by default instead of
+# plain HTTPS. Those Xet endpoints stall indefinitely on Cloud Build's network (the
+# ordinary HF Hub HTTPS endpoints do NOT — confirmed: a CLIP config fetch returns in
+# ~0.2s, and the token is valid, so it was never rate-limiting). Forcing the classic HTTP
+# download path, which always worked before hf-xet existed, unblocks the model bakes.
 ENV HF_HOME=/opt/ml-cache/hf \
     TORCH_HOME=/opt/ml-cache/torch \
-    XDG_CACHE_HOME=/opt/ml-cache/xdg
+    XDG_CACHE_HOME=/opt/ml-cache/xdg \
+    HF_HUB_DISABLE_XET=1
 RUN useradd --create-home --uid 10001 appuser \
     && mkdir -p /opt/ml-cache && chown -R appuser:appuser /opt/ml-cache /app
 USER appuser
+
+# Optional HF token for the model-precache RUN steps below (build-time only, injected via
+# Cloud Build's Secret Manager integration — see backend/cloudbuild.yaml; NEVER via
+# --substitutions/--build-arg on the command line, which Cloud Build logs in plaintext).
+# Anonymous HF Hub requests are rate-limited and have repeatedly stalled builds in this
+# project past the 60min Cloud Build timeout; a token avoids both. NOT baked into the
+# final image as a readable env var — this ENV is overridden to empty below, in the same
+# final layer sequence, before COPY; `docker history`/an image inspection never shows a
+# token value. Empty ARG (the default, e.g. a local `docker build` with no --build-arg)
+# = anonymous requests, unchanged behavior.
+ARG HF_TOKEN=
+ENV HF_TOKEN=${HF_TOKEN}
 
 # Pre-cache CLIP weights at build so the first request isn't a ~600 MB download.
 RUN python -c "from transformers import CLIPModel, CLIPProcessor; \
@@ -47,14 +82,16 @@ RUN python -c "from detoxify import Detoxify; Detoxify('original')" \
        pipeline('text-classification', \
                 model='protectai/deberta-v3-base-prompt-injection-v2', truncation=True)"
 
-# Pre-cache the topic-check embedding model (guard latency fix, 2026-07) — same reasoning
-# as above: without this, HF_HUB_OFFLINE=1 below means the model can NEVER load at
-# runtime, so topic_check would always fail-open (return None), silently defeating the
-# whole "skip Layer 3 when confident" optimization. Keep in sync with .env's
-# TOPIC_CHECK_MODEL; a non-default value re-downloads once (network required then).
-RUN python -c "from transformers import AutoModel, AutoTokenizer; \
-       AutoTokenizer.from_pretrained('sentence-transformers/all-MiniLM-L6-v2'); \
-       AutoModel.from_pretrained('sentence-transformers/all-MiniLM-L6-v2')"
+# NOTE: the topic-check embedding model (all-MiniLM-L6-v2) is NOT downloaded here, unlike
+# the models above. Its weights are served only via HF's Xet CDN, which fails on Cloud
+# Build's network (403 SignatureError), so it can't be baked from the Hub. It's committed
+# to the repo (backend/models/all-MiniLM-L6-v2, Git LFS) and arrives via the COPY below;
+# topic_check.py loads it from that local path (TOPIC_CHECK_MODEL=models/all-MiniLM-L6-v2).
+
+# Clear the token now that every model-precache step is done — must not persist as a
+# readable env var in the final image. Nothing after this point needs HF access anyway
+# (HF_HUB_OFFLINE=1 below forbids it).
+ENV HF_TOKEN=
 
 COPY --chown=appuser:appuser . .
 

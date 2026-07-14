@@ -104,7 +104,19 @@ if ! gcloud artifacts repositories describe "$REPO" --location "$REGION" \
 fi
 
 echo "[deploy-app] building + pushing backend image..."
-gcloud builds submit backend --project "$PROJECT" --tag "$BACKEND_IMAGE"
+# Uses backend/cloudbuild.yaml so the build can inject HF_TOKEN via Cloud Build's native
+# Secret Manager integration (availableSecrets/secretEnv) — stabilizes the Dockerfile's
+# multiple HuggingFace model-precache steps (CLIP, detoxify, deberta-injection, the
+# topic-check embedding model): anonymous HF Hub requests are rate-limited and have
+# repeatedly stalled builds past the 60min Cloud Build timeout in this project.
+# IMPORTANT: the secret "HF_TOKEN" must already exist in Secret Manager (console or
+# `gcloud secrets create HF_TOKEN --data-file=-`) with the Cloud Build service account
+# (PROJECT_NUMBER@cloudbuild.gserviceaccount.com) granted roles/secretmanager.secretAccessor
+# on it — NEVER pass the token via --substitutions/--build-arg on this command line, which
+# Cloud Build logs in plaintext (tried once, reverted for exactly that reason).
+gcloud builds submit backend --project "$PROJECT" \
+  --config backend/cloudbuild.yaml \
+  --substitutions="_IMAGE=${BACKEND_IMAGE}"
 
 SA_ARGS=()   # extra `gcloud run deploy` args for the backend (service account, when real)
 NEEDS_SA=0
@@ -217,7 +229,7 @@ BACKEND_ENV+=",GUARD_TOXICITY_MODEL=original,GUARD_INJECTION_MODEL=protectai/deb
 # confidently clean (below these LOW thresholds, well under the block thresholds above)
 # AND confidently on-topic per the cheap zero-shot classifier below. See guard.py.
 BACKEND_ENV+=",GUARD_TOXICITY_LOW=0.15,GUARD_INJECTION_LOW=0.2"
-BACKEND_ENV+=",TOPIC_CHECK_ENABLED=1,TOPIC_CHECK_MODEL=sentence-transformers/all-MiniLM-L6-v2,TOPIC_CHECK_THRESHOLD=0.44"
+BACKEND_ENV+=",TOPIC_CHECK_ENABLED=1,TOPIC_CHECK_MODEL=models/all-MiniLM-L6-v2,TOPIC_CHECK_THRESHOLD=0.44"
 BACKEND_ENV+=",GUARD_LLM_ENABLED=${GUARD_LLM_ENABLED},GUARD_LLM_URL=${GUARD_URL},GUARD_LLM_AUTH=${GUARD_LLM_AUTH},GUARD_LLM_MODEL=llama-guard3:1b,GUARD_LLM_TIMEOUT=60"
 BACKEND_ENV+=",CHART_CLIP_MODEL=openai/clip-vit-base-patch32,CHART_CLIP_THRESHOLD=0.5,CHART_MIN_DATA_DIGITS=2,CHART_BLOCK_THRESHOLD=0.4"
 BACKEND_ENV+=",CHART_SAMPLE_SIZE=128,CHART_MIN_BACKGROUND_RATIO=0.18,CHART_MAX_DISTINCT_COLORS=48,TESSERACT_CMD="
