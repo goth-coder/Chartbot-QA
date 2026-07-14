@@ -1,18 +1,33 @@
-/* Chart VQA — Voltagent-inspired surface (see DESIGN.md).
+/* Chartbot QA — Voltagent-inspired surface (see DESIGN.md).
    Dark canvas, single green accent, hairline borders, Inter + mono. */
 
+/* Desktop: a left SIDE panel (nav-bar) + the chat filling the rest of the viewport height
+   — more vertical room for the transcript than a horizontal header would leave. Mobile
+   (see the @media block at the bottom) switches .page back to a column with .nav-bar as a
+   normal top header, since a side rail doesn't work at phone widths. */
 .page {
-  min-height: 100vh;
+  display: flex;
+  flex-direction: row;
+  height: 100vh;
   background-color: var(--canvas);
 }
 
 /* ── Nav ─────────────────────────────────────────────────────────── */
 .nav-bar {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: var(--s-md) var(--s-3xl);
-  border-bottom: 1px solid var(--hairline);
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--s-lg);
+  width: 220px;
+  flex-shrink: 0;
+  padding: var(--s-2xl) var(--s-xl);
+  border-right: 1px solid var(--hairline);
+  border-bottom: none;
+}
+
+.nav-bar .signout {
+  width: 100%;
+  text-align: left;
 }
 
 .brand {
@@ -74,6 +89,11 @@
 
 /* ── Layout ──────────────────────────────────────────────────────── */
 .container {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0; /* let children shrink below their content size instead of overflowing .page */
+  width: 100%;
   max-width: 720px;
   margin: 0 auto;
   padding: var(--s-5xl) var(--s-3xl) var(--s-6xl);
@@ -304,6 +324,13 @@
   background-color: var(--mute);
 }
 
+/* Informational, not an error (e.g. the cold-start hint) — same shape, softer tone. */
+.notice-info {
+  color: var(--mute);
+  background-color: transparent;
+  border-style: dashed;
+}
+
 /* ── Submit loading / processing (Task A) ────────────────────────── */
 .submit-loading {
   display: inline-flex;
@@ -468,6 +495,8 @@
 
 /* ── Chat card (Phase 5 conversational v2) ───────────────────────── */
 .chat-card {
+  flex: 1;
+  min-height: 0; /* allow .transcript below to be the one scrolling element, not the page */
   gap: var(--s-lg);
 }
 
@@ -533,15 +562,18 @@
   color: var(--mute);
 }
 
-/* Transcript — the list of chat bubbles */
+/* Transcript — the list of chat bubbles. flex:1 + min-height:0 (not a fixed max-height)
+   so it's the ONE element that scrolls, sized to whatever room .chat-card actually has in
+   the viewport — the page itself never grows taller than 100vh (see .page/.container). */
 .transcript {
   display: flex;
   flex-direction: column;
+  flex: 1;
+  min-height: 120px;
   gap: var(--s-md);
   margin: 0;
   padding: 0;
   list-style: none;
-  max-height: 460px;
   overflow-y: auto;
 }
 
@@ -783,16 +815,32 @@
 }
 
 /* ── Responsive ──────────────────────────────────────────────────── */
+/* Below 768px: back to a column page with .nav-bar as a normal top header (a side rail
+   eats too much horizontal room on a phone) — everything else (flex:1 chat-card/transcript
+   sizing) still applies, so the chat still fills the viewport without an outer page scroll. */
 @media (max-width: 768px) {
+  .page {
+    flex-direction: column;
+  }
+  .nav-bar {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--s-md);
+    width: 100%;
+    padding: var(--s-md) var(--s-xl);
+    border-right: none;
+    border-bottom: 1px solid var(--hairline);
+  }
+  .nav-bar .signout {
+    width: auto;
+  }
   .container {
     padding: var(--s-4xl) var(--s-xl) var(--s-5xl);
   }
   .hero-title {
     font-size: 32px;
     line-height: 36px;
-  }
-  .nav-bar {
-    padding: var(--s-md) var(--s-xl);
   }
   .bubble {
     max-width: 100%;

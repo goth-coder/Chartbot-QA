@@ -42,6 +42,11 @@ function App() {
   const [error, setError] = useState('')
   // Per-stage progress for the pending turn, keyed by SSE stage name.
   const [stages, setStages] = useState({})
+  // True once the "vlm" stage has been running a while — the VLM is a scale-to-zero Cloud
+  // Run GPU service, so the FIRST request after it's been idle pays a real cold-start cost
+  // (~90-100s to load the model) hidden inside this one stage. Surfaced as a hint, not
+  // measured precisely — see the timer effect below.
+  const [coldStartHint, setColdStartHint] = useState(false)
   const [mockBanner, setMockBanner] = useState(false)
   // Google ID token (Phase 3.7 required sign-in). null when signed out; also null
   // permanently when HAS_AUTH is false. sessionStorage: survives refresh, cleared on tab close.
@@ -63,7 +68,16 @@ function App() {
     const restored = await getConversation(idToken)
     if (restored?.conversation_id && restored.messages?.length) {
       setConversationId(restored.conversation_id)
-      setMessages(restored.messages)
+      // The backend sends snake_case (image_data_uri, image_index); a live turn instead
+      // sets imageUrl/imageIndex (see onSubmit) — normalize restored messages to the same
+      // shape so the transcript renders chart bubbles + the "Image N" caption identically.
+      setMessages(
+        restored.messages.map((m) => ({
+          ...m,
+          ...(m.image_data_uri && { imageUrl: m.image_data_uri }),
+          ...(m.image_index && { imageIndex: m.image_index }),
+        }))
+      )
     }
   }
 
@@ -164,6 +178,19 @@ function App() {
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
   }, [messages, loading, stages])
+
+  // Cold-start hint: the "vlm" stage covers both a warm answer (~1-2s) and a cold Cloud
+  // Run GPU spin-up (~90-100s to load the model) with no distinct signal between them —
+  // so after a few seconds of "vlm" still running, assume it's cold and say so, rather
+  // than leaving the user staring at a spinner with no idea why it's slow.
+  useEffect(() => {
+    if (stages.vlm?.status !== 'start') {
+      setColdStartHint(false)
+      return
+    }
+    const t = setTimeout(() => setColdStartHint(true), 8000)
+    return () => clearTimeout(t)
+  }, [stages.vlm?.status])
 
   function selectImage(file) {
     if (!file) return
@@ -511,6 +538,13 @@ function App() {
                   )
                 })}
               </ul>
+            )}
+
+            {loading && coldStartHint && (
+              <p className="notice notice-info" role="status">
+                <span className="notice-dot" aria-hidden="true" />
+                First answer after a while can take a bit longer — the model is starting up.
+              </p>
             )}
 
             {error && (
